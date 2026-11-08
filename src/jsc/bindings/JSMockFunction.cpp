@@ -26,6 +26,7 @@
 #include <JavaScriptCore/JSModuleEnvironment.h>
 #include <JavaScriptCore/JSModuleNamespaceObject.h>
 #include <JavaScriptCore/JSBoundFunction.h>
+#include <JavaScriptCore/JSFunctionWithFields.h>
 #include <JavaScriptCore/JSMapInlines.h>
 #include <JavaScriptCore/ArrayConstructor.h>
 #include <JavaScriptCore/ObjectPrototypeInlines.h>
@@ -129,6 +130,8 @@ JSC_DECLARE_HOST_FUNCTION(jsMockFunctionWithImplementation);
 JSC_DECLARE_HOST_FUNCTION(jsMockFunctionReturnThis);
 JSC_DECLARE_HOST_FUNCTION(jsMockFunctionRejectWithThis);
 JSC_DECLARE_HOST_FUNCTION(jsMockFunctionThrowThis);
+JSC_DECLARE_HOST_FUNCTION(jsSpiedValueGet);
+JSC_DECLARE_HOST_FUNCTION(jsSpiedValueSet);
 
 uint64_t JSMockModule::s_nextInvocationId = 0;
 
@@ -733,6 +736,16 @@ public:
         m_initialImplementation.set(vm(), this, function);
         setFallbackImplementation(JSMockImplementation::Kind::Call, function);
         this->updatePrototype(globalObject);
+    }
+
+    // The function a new mock starts from: what a spy replaces, or what fn() was given.
+    ALWAYS_INLINE void setOriginal(JSGlobalObject* globalObject, JSValue function)
+    {
+        if (!isVitest) {
+            pushImpl(globalObject, JSMockImplementation::Kind::Call, function);
+            return;
+        }
+        setInitialImplementation(globalObject, function);
     }
 
     void pushImpl(JSGlobalObject* globalObject, JSMockImplementation::Kind kind, JSValue value)
@@ -1913,6 +1926,70 @@ JSC_DEFINE_HOST_FUNCTION(jsMockFunctionReturnThis, (JSC::JSGlobalObject*, JSC::C
     return JSValue::encode(callframe->thisValue());
 }
 
+// The getter and setter a plain property has while one of the two is spied on.
+namespace SpiedValue {
+using Field = JSC::JSFunctionWithFields::Field;
+// The getter's fields. Its setter is undefined if the property can't be written.
+static constexpr auto value = static_cast<Field>(0);
+static constexpr auto setter = static_cast<Field>(1);
+// The setter's fields.
+static constexpr auto getter = static_cast<Field>(0);
+static constexpr auto key = static_cast<Field>(1);
+}
+
+// The getter of the pair that `half` is one of, or null.
+static JSC::JSFunctionWithFields* getterOfSpiedValue(JSValue half)
+{
+    auto* function = dynamicDowncast<JSC::JSFunctionWithFields>(half);
+    if (!function)
+        return nullptr;
+    auto native = function->nativeFunction();
+    if (native == JSC::toTagged(jsSpiedValueGet))
+        return function;
+    if (native == JSC::toTagged(jsSpiedValueSet))
+        return uncheckedDowncast<JSC::JSFunctionWithFields>(function->getField(SpiedValue::getter));
+    return nullptr;
+}
+
+JSC_DEFINE_HOST_FUNCTION(jsSpiedValueGet, (JSC::JSGlobalObject*, JSC::CallFrame* callframe))
+{
+    return JSValue::encode(uncheckedDowncast<JSC::JSFunctionWithFields>(callframe->jsCallee())->getField(SpiedValue::value));
+}
+
+// Stores the way an assignment to a data property does: an object that only inherits the property gets one of its own.
+JSC_DEFINE_HOST_FUNCTION_WITH_ATTRIBUTES(jsSpiedValueSet, __attribute__((minsize)), (JSC::JSGlobalObject * globalObject, JSC::CallFrame* callframe))
+{
+    auto& vm = JSC::getVM(globalObject);
+    auto scope = DECLARE_THROW_SCOPE(vm);
+    auto* setter = uncheckedDowncast<JSC::JSFunctionWithFields>(callframe->jsCallee());
+    auto* getter = uncheckedDowncast<JSC::JSFunctionWithFields>(setter->getField(SpiedValue::getter));
+    JSValue value = callframe->argument(0);
+    JSValue receiver = callframe->thisValue();
+
+    // A spy passes on undefined for an assignment to a global variable, whose `this` is the scope.
+    if (!receiver.isUndefined()) {
+        JSValue keyValue = setter->getField(SpiedValue::key);
+        Identifier key = keyValue.isSymbol() ? Identifier::fromUid(asSymbol(keyValue)->privateName()) : Identifier::fromString(vm, asString(keyValue)->value(globalObject));
+        RETURN_IF_EXCEPTION(scope, {});
+        bool hasAccessor = false;
+        if (JSObject* object = receiver.getObject()) {
+            // The target answers for a Proxy, so that no trap decides where the value goes.
+            for (auto* proxy = dynamicDowncast<ProxyObject>(object); proxy && !proxy->isRevoked(); proxy = dynamicDowncast<ProxyObject>(object))
+                object = proxy->target();
+            PropertySlot slot(object, PropertySlot::InternalMethodType::GetOwnProperty);
+            hasAccessor = object->methodTable()->getOwnPropertySlot(object, globalObject, key, slot) && slot.isAccessor();
+            RETURN_IF_EXCEPTION(scope, {});
+        }
+        if (!hasAccessor) {
+            scope.release();
+            JSC::ordinarySetWithOwnDescriptor(globalObject, getter, key, value, receiver, PropertyDescriptor(getter->getField(SpiedValue::value), 0), true);
+            return JSValue::encode(jsUndefined());
+        }
+    }
+    getter->setField(vm, SpiedValue::value, value);
+    return JSValue::encode(jsUndefined());
+}
+
 JSC_DEFINE_HOST_FUNCTION(jsMockFunctionRejectWithThis, (JSC::JSGlobalObject * globalObject, JSC::CallFrame* callframe))
 {
     auto scope = DECLARE_THROW_SCOPE(JSC::getVM(globalObject));
@@ -2945,11 +3022,7 @@ __attribute__((minsize)) static void wrapFunction(Zig::GlobalObject* globalObjec
     mock->copyStaticProperties(globalObject, asObject(function));
     RETURN_IF_EXCEPTION(scope, );
     scope.release();
-    if (!mock->isVitest) {
-        mock->pushImpl(globalObject, JSMockImplementation::Kind::Call, function);
-        return;
-    }
-    mock->setInitialImplementation(globalObject, function);
+    mock->setOriginal(globalObject, function);
 }
 
 static String propertyKeyForMessage(const Identifier& key)
@@ -3222,6 +3295,20 @@ __attribute__((minsize)) static JSC::EncodedJSValue spyOn(JSC::JSGlobalObject* l
     JSValue getter = descriptor.isAccessorDescriptor() ? descriptor.getter() : jsUndefined();
     JSValue setter = descriptor.isAccessorDescriptor() ? descriptor.setter() : jsUndefined();
 
+    // An object that inherits the accessor of a spied plain property inherits that plain property.
+    if (!isOwn) {
+        auto* inherited = getterOfSpiedValue(getter);
+        if (!inherited)
+            inherited = getterOfSpiedValue(setter);
+        if (inherited) {
+            unsigned attributes = descriptor.attributes() & PropertyAttribute::DontEnum;
+            if (inherited->getField(SpiedValue::setter).isUndefined())
+                attributes |= PropertyAttribute::ReadOnly;
+            descriptor = PropertyDescriptor(inherited->getField(SpiedValue::value), attributes);
+            getter = setter = jsUndefined();
+        }
+    }
+
     JSValue original = access == SpyAccess::Set ? setter : getter;
     // One mock as both getter and setter is the spy easymode installs for a non-function value. It's returned as is below.
     if (access == SpyAccess::Value && !(getter == setter && dynamicDowncast<JSMockFunction>(getter))) {
@@ -3253,8 +3340,37 @@ __attribute__((minsize)) static JSC::EncodedJSValue spyOn(JSC::JSGlobalObject* l
         return {};
     }
 
+    // A plain property reads and stores one value. As an accessor it still does, through a getter and, if it can be written, a setter.
+    // Not a custom value with a setter: native code reads what that setter stores, and this pair would not reach it.
+    auto hasNativeSetter = [&] {
+        auto* custom = tryJSDynamicCast<CustomGetterSetter*>(storage);
+        return custom && custom->setter();
+    };
+    if (access != SpyAccess::Value && descriptor.isDataDescriptor() && !hasNativeSetter()) {
+        bool isWritable = descriptor.writable();
+        // A write through an object that only inherits the property defines one on it.
+        if (isWritable && !isOwn) {
+            isWritable = object->isExtensible(globalObject);
+            RETURN_IF_EXCEPTION(scope, {});
+        }
+        auto* valueGetter = JSC::JSFunctionWithFields::create(vm, globalObject, vm.getHostFunction(jsSpiedValueGet, ImplementationVisibility::Public, callHostFunctionAsConstructor, 0, String()));
+        valueGetter->setField(vm, SpiedValue::value, descriptor.value());
+        getter = valueGetter;
+        if (isWritable) {
+            auto* valueSetter = JSC::JSFunctionWithFields::create(vm, globalObject, vm.getHostFunction(jsSpiedValueSet, ImplementationVisibility::Public, callHostFunctionAsConstructor, 1, String()));
+            valueSetter->setField(vm, SpiedValue::getter, valueGetter);
+            valueSetter->setField(vm, SpiedValue::key, propertyKeyValue.isString() || propertyKeyValue.isSymbol() ? propertyKeyValue : JSC::identifierToJSValue(vm, propertyKey));
+            setter = valueSetter;
+        }
+        valueGetter->setField(vm, SpiedValue::setter, setter);
+        original = access == SpyAccess::Set ? setter : getter;
+    }
+
     auto* mock = createMockFunction(vm, globalObject, isVitest);
-    if (original.isCallable()) {
+    if (access != SpyAccess::Value && getterOfSpiedValue(original)) {
+        // Not wrapFunction(): the spy gets its name below, and a copy of the length would allocate.
+        mock->setOriginal(globalObject, original);
+    } else if (original.isCallable()) {
         wrapFunction(globalObject, mock, original);
     } else if (access == SpyAccess::Get && descriptor.isDataDescriptor()) {
         mock->pushImpl(globalObject, JSMockImplementation::Kind::ReturnValue, descriptor.value());
