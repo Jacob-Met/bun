@@ -125,6 +125,28 @@ export function area(shape: Shape): Sizes.Size {
     expect(await compile(String(dir))).toEqual(USED);
   });
 
+  test("a member of an enum under a cast is written into an .aot.ts file that compiles", async () => {
+    using dir = tempDir("aot-library-typed-file-enum-cast", {
+      ...library,
+      "library/src/area.ts": `import type { Shape } from "./index";
+enum Scale {
+  One = 1,
+  Three = 3,
+}
+let scale = Scale.One as Scale | null;
+function unit() {
+  return { scale: Scale.One as const };
+}
+export function area(shape: Shape): number {
+  scale = shape.kind === "circle" ? Scale.Three : null;
+  return (scale ?? unit().scale) * shape.size ** 2;
+}
+`,
+    });
+    await install(String(dir));
+    expect(await compile(String(dir))).toEqual(USED);
+  });
+
   // The React Compiler prints `(first = 1)` as `(t0) { let first = t0 === undefined ? 1 : t0`.
   test("a call may leave out a parameter whose default value the React Compiler moved into the function", async () => {
     using dir = tempDir("aot-library-typed-file-moved-default", {

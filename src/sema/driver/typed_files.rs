@@ -3785,7 +3785,7 @@ impl<'a> Transfer<'_, 'a, '_> {
                 .chain(properties)
                 .filter_map(|(initializer, place, key)| Some((initializer.some()?, (place, key?))))
                 .collect();
-            let enum_member_type = |expr: ExprId| {
+            let enum_member_cast = |expr: ExprId| {
                 let ExprKind::Dot { obj, .. } = syntax.file[expr].kind else {
                     return None;
                 };
@@ -3793,13 +3793,13 @@ impl<'a> Transfer<'_, 'a, '_> {
                 let name = linked
                     .enum_names
                     .get(&(index as u32, syntax.file.exprs.get(obj.idx())?.pos))?;
-                Some([&name[..], b".", syntax.word(name_pos)].concat())
+                Some([&b" as "[..], name, b".", syntax.word(name_pos)].concat())
             };
             let mut chains = syntax.cast_chains();
             let operands: FxHashSet<ExprId> = chains.iter().map(|chain| chain.operand).collect();
             let members = (0..syntax.file.exprs.len() as u32)
                 .map(ExprId)
-                .filter(|&expr| !operands.contains(&expr) && enum_member_type(expr).is_some());
+                .filter(|&expr| !operands.contains(&expr) && enum_member_cast(expr).is_some());
             chains.extend(members.map(|expr| CastChain {
                 operand: expr,
                 outermost: expr,
@@ -3825,7 +3825,7 @@ impl<'a> Transfer<'_, 'a, '_> {
                 }) else {
                     continue;
                 };
-                let member = enum_member_type(chain.operand).filter(|_| is_literal(operand));
+                let member = enum_member_cast(chain.operand).filter(|_| is_literal(operand));
                 if member.is_none() && chain.casts.is_empty() {
                     continue;
                 }
@@ -3846,7 +3846,7 @@ impl<'a> Transfer<'_, 'a, '_> {
                 let (mut opens, mut suffix) = (0usize, Vec::new());
                 let is_member = member.is_some();
                 if let Some(member) = member {
-                    suffix.extend_from_slice(&[b" as ", &member[..]].concat());
+                    suffix.extend_from_slice(&member);
                     level = Level::Compare;
                     let kinds = || chain.casts.iter().map(|&cast| &syntax.file[cast].kind);
                     // Under an `as` the place has the type of the `as`. Without one it has the enum, which `0 as E.M` does not widen to.
@@ -3863,7 +3863,10 @@ impl<'a> Transfer<'_, 'a, '_> {
                     });
                     if let Some(name) = linked.enum_names.get(&(index as u32, source_position)) {
                         // `E.M as const` is the member, and does not widen to the enum.
-                        let name = if is_const { &member } else { name };
+                        let name = match is_const {
+                            true => &member[b" as ".len()..],
+                            false => &name[..],
+                        };
                         if let Some((parameter, written)) = moved {
                             let text = match written {
                                 Unannotated::Typed => Vec::new(),
@@ -4673,22 +4676,24 @@ fn target_of_declaration(
 
 /// The text of `ty` where it names nothing: a keyword, or a literal that is no member of an enum.
 fn text_that_names_nothing(services: &mut Services<'_, '_, '_>, ty: TypeId) -> Option<Box<[u8]>> {
-    if services.type_flags(ty).contains(TypeFlags::ENUM_LITERAL) {
+    let flags = services.type_flags(ty);
+    let names_nothing = TypeFlags::STRING_LITERAL
+        | TypeFlags::NUMBER_LITERAL
+        | TypeFlags::BIG_INT_LITERAL
+        | TypeFlags::INTRINSIC;
+    if !flags.intersects(names_nothing) || flags.contains(TypeFlags::ENUM_LITERAL) {
         return None;
     }
-    Some(match services.intrinsic_name(ty) {
-        // No type that a typed file can write: a name that does not resolve, and the `intrinsic` of a library.
-        Some("error" | "intrinsic") => return None,
-        // `boolean` also where the source has an alias of `true | false`, which the printer names.
-        Some(keyword) => keyword.as_bytes().into(),
-        // `Infinity` is a value and no type.
-        None => match services.literal_value(ty)? {
-            LiteralValue::Number(value) if !value.is_finite() => b"number"[..].into(),
-            _ => {
-                let format = TypeFormatFlags::DEFAULT | TypeFormatFlags::NO_TRUNCATION;
-                services.type_to_string(ty, None, format).into()
-            }
-        },
+    let value = services.literal_value(ty);
+    Some(if flags.contains(TypeFlags::BOOLEAN) {
+        // The printer names an alias of `true | false`.
+        b"boolean"[..].into()
+    } else if matches!(value, Some(LiteralValue::Number(value)) if !value.is_finite()) {
+        // The printer says `Infinity`, which is a value and no type.
+        b"number"[..].into()
+    } else {
+        let format = TypeFormatFlags::DEFAULT | TypeFormatFlags::NO_TRUNCATION;
+        services.type_to_string(ty, None, format).into()
     })
 }
 
