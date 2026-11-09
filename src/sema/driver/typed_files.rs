@@ -74,9 +74,8 @@ impl Slot {
 struct DefaultedParameter {
     function: FnId,
     annotation: TypeNodeId,
+    value: ExprId,
     is_name: bool,
-    /// The default value is a cast, as `x as T` is. Only `copy_casts` knows whether the output has that cast.
-    is_cast: bool,
     /// A `?` on it is an error: a parameter behind it has to be passed.
     is_before_required: bool,
 }
@@ -284,8 +283,8 @@ fn defaulted_parameters(
                     DefaultedParameter {
                         function: FnId(id),
                         annotation: parameter.ty,
+                        value: parameter.default,
                         is_name: matches!(file[parameter.pat].kind, PatKind::Ident(_)),
-                        is_cast: file.type_assertion_operand(parameter.default).is_some(),
                         is_before_required: last_required.is_some_and(|last| place < last),
                     },
                 );
@@ -1579,7 +1578,7 @@ struct Bundle<'a> {
     modules: &'a [ModuleTypes],
     emitted_declarations: &'a [ModuleTypes],
     entry_point: Option<&'a [u8]>,
-    unannotated: Unannotated,
+    types_of_defaults: TypesOfDefaults,
 }
 
 struct Written<'a, 's> {
@@ -3201,13 +3200,13 @@ fn add_types(
         dropped_casts: 0,
         hoisted: Vec::new(),
         optional_parameter_properties,
-        unannotated: bundle.unannotated,
+        types_of_defaults: bundle.types_of_defaults,
         moved_defaults: MovedDefaults::default(),
     };
     transfer.copy_slots(&source_slots, &session, &atoms);
-    transfer.copy_to_moved_defaults();
     transfer.annotate_generated_code();
     transfer.copy_casts();
+    transfer.copy_to_moved_defaults();
     transfer.type_enum_and_namespace_objects();
     transfer.copy_statements();
     transfer.copy_directives();
@@ -3215,13 +3214,13 @@ fn add_types(
     transfer.finish()
 }
 
-/// Whether a parameter without an annotation has a type, where the output has its default value in the function body.
+/// The types that a typed file has for a default value that the output has in a function body.
 #[derive(Copy, Clone, PartialEq, Eq)]
-pub enum Unannotated {
-    /// The type of its default value, from the type checker or from an `x as T`.
-    Typed,
-    /// Nothing: the typed files did not check with a type. The function body can have lost the types that agree with it.
-    Untyped,
+pub enum TypesOfDefaults {
+    /// The annotation of the parameter on the variable that holds the value, and the type of the value on a parameter without one.
+    Written,
+    /// Neither. The typed files did not check with them: the function body can have lost a type that agrees with them.
+    LeftOut,
 }
 
 /// The parameters whose default value the output has in the function body. Nothing is in here for a build that moves none.
@@ -3231,8 +3230,18 @@ struct MovedDefaults {
     of_sources: FxHashMap<u32, FxHashMap<u32, DefaultedParameter>>,
     /// Each that `copy_slots` gave no type, with where, and whether a `?` is an error there. `copy_casts` can find its type.
     untyped: FxHashMap<(u32, u32), (u32, bool)>,
-    /// The annotation of each parameter that has one, for the variable that its default value is now stored to.
-    annotations: FxHashMap<(u32, u32), Vec<u8>>,
+    /// The annotation of each parameter that has one, for the variable that its default value is now stored to, and where that value is.
+    annotations: FxHashMap<(u32, u32), (Vec<u8>, (u32, u32))>,
+    /// Where a source has a cast or an enum member that `copy_casts` found no place for in the output.
+    lost_casts: Vec<(u32, u32)>,
+}
+
+impl MovedDefaults {
+    fn note_lost_cast(&mut self, source: u32, at: u32) {
+        if !self.annotations.is_empty() {
+            self.lost_casts.push((source, at));
+        }
+    }
 }
 
 struct Transfer<'t, 'a, 's> {
@@ -3247,7 +3256,7 @@ struct Transfer<'t, 'a, 's> {
     dropped_casts: usize,
     hoisted: Vec<u8>,
     optional_parameter_properties: FxHashMap<(u32, u32), (u32, bool)>,
-    unannotated: Unannotated,
+    types_of_defaults: TypesOfDefaults,
     moved_defaults: MovedDefaults,
 }
 
@@ -3273,7 +3282,7 @@ impl<'a> Transfer<'_, 'a, '_> {
             (self.output, self.mappings, self.modules, self.linked);
         let (output_file, insertions) = (output.file, &mut self.insertions);
         let (sources, moved) = (self.sources, &mut self.moved_defaults);
-        let unannotated = self.unannotated;
+        let types_of_defaults = self.types_of_defaults;
         let parameter_count_of: FxHashMap<u32, usize> = output_file
             .fns
             .iter()
@@ -3350,15 +3359,24 @@ impl<'a> Transfer<'_, 'a, '_> {
                             let optional = || [&b"?"[..], &text].concat();
                             let written = with_undefined.unwrap_or_else(optional);
                             // An annotation that takes `undefined` is not the type of the variable: see [`ParameterType`].
-                            if !noted.is_some_and(|noted| noted.takes_undefined) {
-                                moved.annotations.insert((source, key), text);
+                            if types_of_defaults == TypesOfDefaults::Written
+                                && !noted.is_some_and(|noted| noted.takes_undefined)
+                            {
+                                let value = module.syntax.outer_span(default.value);
+                                moved.annotations.insert((source, key), (text, value));
                             }
                             written
                         }
                         (None, is_before_required) => {
-                            // The checker says the type of a default value that is no cast, if it names nothing.
+                            // The checker says the type of a default value, if it names nothing. Only `copy_casts` knows whether the output has a cast.
+                            let is_cast = module.is_some_and(|module| {
+                                let file = module.syntax.file;
+                                file.type_assertion_operand(default.value).is_some()
+                            });
                             let noted = noted
-                                .filter(|_| unannotated == Unannotated::Typed && !default.is_cast)
+                                .filter(|_| {
+                                    types_of_defaults == TypesOfDefaults::Written && !is_cast
+                                })
                                 .and_then(|noted| noted.text.as_deref());
                             if noted.is_none() && module.is_some() {
                                 let place = (slot.start, is_before_required);
@@ -3436,7 +3454,11 @@ impl<'a> Transfer<'_, 'a, '_> {
     /// `let a: T = t0 === undefined ? [] : t0`. The source map has the parameter for such a statement, nothing for `a`.
     fn copy_to_moved_defaults(&mut self) {
         let (output_file, mappings) = (self.output.file, self.mappings);
-        let annotations = &self.moved_defaults.annotations;
+        let MovedDefaults {
+            annotations,
+            lost_casts,
+            ..
+        } = &self.moved_defaults;
         if annotations.is_empty() {
             return;
         }
@@ -3455,8 +3477,16 @@ impl<'a> Transfer<'_, 'a, '_> {
             {
                 continue;
             }
-            let parameter = mappings.original(statement.start);
-            if let Some(annotation) = parameter.and_then(|parameter| annotations.get(&parameter)) {
+            let Some(parameter) = mappings.original(statement.start) else {
+                continue;
+            };
+            let Some((annotation, (start, end))) = annotations.get(&parameter) else {
+                continue;
+            };
+            // Without a cast that the source has, the default value can be of another type than the annotation.
+            let is_lost =
+                |&(source, at): &(u32, u32)| source == parameter.0 && (*start..*end).contains(&at);
+            if !lost_casts.iter().any(is_lost) {
                 (self.insertions).add(name.end, Order::Slot, annotation.clone());
             }
         }
@@ -3562,7 +3592,7 @@ impl<'a> Transfer<'_, 'a, '_> {
         let (output, mappings, written, linked) =
             (self.output, self.mappings, self.modules, self.linked);
         let (output_file, insertions) = (output.file, &mut self.insertions);
-        let unannotated = self.unannotated;
+        let types_of_defaults = self.types_of_defaults;
         let output_context = output.context();
         let mut output_expressions: FxHashMap<(Shape, u32, u32), ExprId> = FxHashMap::default();
         for index in 0..output_file.exprs.len() {
@@ -3753,6 +3783,8 @@ impl<'a> Transfer<'_, 'a, '_> {
                             .filter(|&literal| is_literal(literal))
                     })
                 }) else {
+                    self.moved_defaults
+                        .note_lost_cast(index as u32, source_position);
                     continue;
                 };
                 let member = enum_member_cast(chain.operand).filter(|_| is_literal(operand));
@@ -3765,6 +3797,8 @@ impl<'a> Transfer<'_, 'a, '_> {
                         != output.needs_parentheses(&output_context, operand, operand)
                 {
                     self.dropped_casts += 1;
+                    self.moved_defaults
+                        .note_lost_cast(index as u32, source_position);
                     continue;
                 }
                 let (start, end) = output.outer_span(operand);
@@ -3786,13 +3820,17 @@ impl<'a> Transfer<'_, 'a, '_> {
                     suffix.extend_from_slice(&member);
                     level = Level::Compare;
                     let kinds = || chain.casts.iter().map(|&cast| &syntax.file[cast].kind);
-                    // Under an `as` the place has the type of the `as`. Without one it has the enum, which `0 as E.M` does not widen to.
                     let is_asserted = kinds().any(|kind| matches!(kind, ExprKind::As { .. }));
                     let is_const = kinds().any(|kind| matches!(kind, ExprKind::AsConst(_)));
+                    // Under an `as`, the place that holds the value (`unit = 0`) has the type of the `as`. Without one it has the enum, which `0 as E.M` does not widen to.
+                    let holds_value = |declared: &&u32| {
+                        let equals = output.after_trivia(**declared);
+                        output.byte(equals) == b'=' && output.after_trivia(equals + 1) == start
+                    };
                     let declared = widened
                         .get(&chain.outermost)
-                        .filter(|_| !is_asserted)
-                        .and_then(|&(place, key)| output_places.get(&(place, index as u32, key)));
+                        .and_then(|&(place, key)| output_places.get(&(place, index as u32, key)))
+                        .filter(|declared| !(is_asserted && holds_value(declared)));
                     if let (Some(&declared), Some(name)) = (
                         declared,
                         linked.enum_names.get(&(index as u32, source_position)),
@@ -3802,9 +3840,16 @@ impl<'a> Transfer<'_, 'a, '_> {
                             true => &member[b" as ".len()..],
                             false => &name[..],
                         };
-                        type_of_default = moved.map(|_| name.to_vec());
-                        // With `--minify-syntax`, `declared` is the variable of a moved default value, and not its parameter.
-                        if !moved.is_some_and(|(_, (parameter, _))| parameter == declared) {
+                        let is_typed = types_of_defaults == TypesOfDefaults::Written;
+                        // The parameter of a moved default value is typed below. With `--minify-syntax`, `declared` is the variable.
+                        let is_parameter =
+                            moved.is_some_and(|(_, (parameter, _))| parameter == declared);
+                        // Such a parameter takes the type of an `as`, and then its variable needs no enum.
+                        let is_of_cast = moved.is_some() && is_asserted && is_typed;
+                        if !is_of_cast && (is_typed || is_parameter) {
+                            type_of_default = moved.map(|_| name.to_vec());
+                        }
+                        if !is_of_cast && !is_parameter {
                             insertions.add(declared, Order::Slot, [&b": "[..], name].concat());
                         }
                     }
@@ -3862,6 +3907,8 @@ impl<'a> Transfer<'_, 'a, '_> {
                 if shorthand_values.contains(&operand) {
                     if opens > 0 {
                         self.dropped_casts += 1;
+                        self.moved_defaults
+                            .note_lost_cast(index as u32, source_position);
                         continue;
                     }
                     insertions.add(
@@ -3882,7 +3929,7 @@ impl<'a> Transfer<'_, 'a, '_> {
                 // The output has the casts of the default value now, so its parameter can have the type of it.
                 let noted = (module.types)
                     .and_then(|types| Some((types, types.parameter(key)?)))
-                    .filter(|_| unannotated == Unannotated::Typed);
+                    .filter(|_| types_of_defaults == TypesOfDefaults::Written);
                 let asserted = noted
                     .filter(|(_, noted)| noted.is_of_default)
                     .and_then(|(types, _)| Some((types, asserted_type(file, chain.outermost)?)))
@@ -5035,7 +5082,7 @@ fn typed_outputs(
     outputs: &[Output<'_>],
     modules: &[ModuleTypes],
     emitted_declarations: &[ModuleTypes],
-    unannotated: Unannotated,
+    types_of_defaults: TypesOfDefaults,
 ) -> Result<Vec<(Vec<u8>, TypedText)>, TypedFilesError> {
     let outdir = outdir.strip_suffix(b"/").unwrap_or(outdir);
     let mut found = Vec::new();
@@ -5045,7 +5092,7 @@ fn typed_outputs(
             modules,
             emitted_declarations,
             entry_point: output.entry_point,
-            unannotated,
+            types_of_defaults,
         };
         let typed =
             add_types_by_source_map(output.path, output.javascript, output.source_map, &bundle)
@@ -5145,7 +5192,7 @@ pub fn build_typed_files(
     outputs: &[Output<'_>],
     modules: &[ModuleTypes],
     emitted_declarations: &[ModuleTypes],
-    unannotated: Unannotated,
+    types_of_defaults: TypesOfDefaults,
 ) -> Result<TypedFiles, TypedFilesError> {
     let outdir = outdir.strip_suffix(b"/").unwrap_or(outdir);
     let mut found = TypedFiles {
@@ -5159,7 +5206,7 @@ pub fn build_typed_files(
         outputs,
         modules,
         emitted_declarations,
-        unannotated,
+        types_of_defaults,
     )?) {
         let name_of = |path: &[u8]| {
             path[bun_core::strings::last_index_of_char(path, b'/').map_or(0, |slash| slash + 1)..]

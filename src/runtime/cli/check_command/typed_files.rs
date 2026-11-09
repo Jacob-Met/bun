@@ -14,7 +14,7 @@ use bun_sema::session::Session;
 use bun_sema::util::SharedSort;
 use bun_sema_driver::host::{Disk, Provided, from_native};
 use bun_sema_driver::typed_files::{
-    ModuleTypes, Output, Unannotated, annotate_implicit_any, build_typed_files,
+    ModuleTypes, Output, TypesOfDefaults, annotate_implicit_any, build_typed_files,
     emitted_declarations_of, module_types, tsconfig_of_sources, typed_path_beside,
 };
 use bun_sema_driver::{Diagnostic, PlanOptions, Report, Request};
@@ -307,10 +307,10 @@ pub(crate) fn typed_files_for_build(
             }
         }
     };
-    let build = |emitted: &[ModuleTypes], unannotated| {
-        build_typed_files(outdir, &outputs, modules, emitted, unannotated)
+    let build = |emitted: &[ModuleTypes], types_of_defaults| {
+        build_typed_files(outdir, &outputs, modules, emitted, types_of_defaults)
     };
-    let without_emitted_declarations = build(&[], Unannotated::Typed);
+    let without_emitted_declarations = build(&[], TypesOfDefaults::Written);
     let untyped_modules = without_emitted_declarations
         .as_ref()
         .map_or(&[][..], |found| &found.modules_of_untyped_values[..]);
@@ -353,7 +353,7 @@ pub(crate) fn typed_files_for_build(
     let emitted_modules = emitted_modules.take();
     let found = match emitted_modules.is_empty() {
         true => without_emitted_declarations,
-        false => build(&emitted_modules, Unannotated::Typed),
+        false => build(&emitted_modules, TypesOfDefaults::Written),
     };
     let mut warn = |why: core::fmt::Arguments<'_>| {
         log.add_warning_fmt(
@@ -372,16 +372,13 @@ pub(crate) fn typed_files_for_build(
         &found.declarations_while_checked,
         &newest_lib,
     );
-    // A type that a parameter has from its default value alone can be the error: the function body can have lost the types that agree with it.
-    let types_a_default = |module: &ModuleTypes| {
-        let mut noted = module.parameters.iter();
-        noted.any(|noted| noted.text.is_some() || noted.is_of_default)
-    };
+    // A type that the typed files have for a moved default value alone can be the error: the function body can have lost the types that agree with it.
+    let has_moved_default = |module: &ModuleTypes| !module.parameters.is_empty();
     if first_error(&report).is_some()
-        && modules.iter().any(types_a_default)
-        && let Ok(untyped) = build(&emitted_modules, Unannotated::Untyped)
+        && modules.iter().any(has_moved_default)
+        && let Ok(without) = build(&emitted_modules, TypesOfDefaults::LeftOut)
     {
-        found = untyped;
+        found = without;
         report = check(
             &mut found.typed,
             &found.declarations_while_checked,

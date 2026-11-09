@@ -560,29 +560,39 @@ console.log(useNoted(), useNoted(1, false));
     expect(typed).toContain("list: Array<typeof t1$0> = [");
   });
 
-  // `label` is a `string` where a function reads it later. Its annotation says more, and is not on the variable.
-  const labelled = `import { useState } from "./state";
+  // The variable that holds the default value takes the annotation of the parameter, but not in these two cases.
+  // `label` is a `string` where a function reads it later, and its annotation says more. The bundle has `config.theme`
+  // without its cast, which is a `string` and no `Theme`.
+  const unlike = `import { useState } from "./state";
+type Theme = "light" | "dark";
+const config: { theme: string } = { theme: "light" };
 export function useLabelled(first = 1, label: string | undefined = "x"): () => number {
   const [value] = useState(first);
   const size = () => label.length + value;
   label = "y";
   return size;
 }
-console.log(useLabelled()());
+export function useDressed(first = 1, theme: Theme = config.theme as Theme): string {
+  const [value] = useState(first);
+  return value + String(theme);
+}
+console.log(useLabelled()(), useDressed());
 `;
-  test("is stored to a variable without an annotation that takes `undefined`", async () => {
-    const typed = await typedHooks(labelled);
+  test("is stored to a variable without an annotation that is not the type of the variable", async () => {
+    const typed = await typedHooks(unlike);
     expect(parametersIn(typed)).toEqual({
       useState: "initial: T",
       useLabelled: "t0?: number, t1?: string | undefined",
+      useDressed: "t0?: number, t1?: Theme",
     });
     expect(typed).toContain(`let label = t1 === undefined ? "x" : t1;`);
+    expect(typed).toContain("let theme = t1 === undefined ? config.theme : t1;");
   });
 
   // Observed: `TS18048: 'label' is possibly 'undefined'.` There the source map has a place for the variable, and it
   // takes the annotation of the parameter, as on main.
   test.todo("is stored to such a variable with minify.syntax", async () => {
-    await typedHooks(labelled, { minify: { syntax: true } });
+    await typedHooks(unlike, { minify: { syntax: true } });
   });
 
   // `typeof a` is the type of the parameter `a` as the source has it: with its default value, and without `undefined`.
@@ -634,8 +644,13 @@ console.log(useSigned(1, 2, same, same), useReturned(1, 2), useUnknown(1), useMe
   });
 
   // The compiler output has `useState(null)` for `useState<number | null>(null)`, so `setCount` takes `null` alone.
-  test("has no type from the type checker where the typed files do not check with it", async () => {
+  // The typed files are then what they are without this rule, but for the `?`: `any`, and the enum of a default value.
+  test("has no type of its default value where the typed files do not check with it", async () => {
     const typed = await typedHooks(`import { useEffect, useState } from "./state";
+export enum Unit {
+  Px,
+  Em,
+}
 export function useCounter(initial = 0): number | null {
   const [count, setCount] = useState<number | null>(null);
   useEffect(() => {
@@ -647,13 +662,25 @@ export function useBoth(first: number = 1, second = 2): number {
   const [value] = useState(first);
   return value + second;
 }
-console.log(useCounter(), useBoth());
+export function useCell(first = 1, unit = Unit.Px as Unit | null): string {
+  const [value] = useState(first);
+  if (unit === null) return value + "none";
+  switch (unit) {
+    case Unit.Px:
+      return value + "px";
+    case Unit.Em:
+      return value + "em";
+  }
+}
+console.log(useCounter(), useBoth(), useCell());
 `);
     expect(parametersIn(typed)).toEqual({
       useState: "initial: T",
       useCounter: "t0?",
       useBoth: "t0?: number, t1?",
+      useCell: expect.stringMatching(/^t0\?, t1\?: Unit\d*$/),
     });
+    expect(typed).toContain("let second = t1 === undefined ? 2 : t1;");
   });
 
   test("in a module that is not checked", async () => {
