@@ -966,7 +966,7 @@ export const sums: number[] = [useBoth(), useBoth(5), useBoth(5, 6)];
     );
     const built = await bun(String(dir), "compile", "--library", "src/index.tsx", "--react-compiler");
     expect(built).toMatchObject({ stderr: "", exitCode: 0 });
-    expect(typedFile(dir)).toContain("t1?: number): number {\n");
+    expect(typedFile(dir)).toContain("function useBoth(t0?: number, t1?: number): number {\n");
     // A package whose .aot.ts files are left out has no "aot" condition.
     expect(json(join(String(dir), "dist/package.json")).exports).toEqual({
       ".": conditions("index"),

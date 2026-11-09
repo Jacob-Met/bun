@@ -4852,11 +4852,13 @@ pub fn module_types(
                 node: hir.node(parameter.default),
             };
             let is_annotated = parameter.ty.is_some();
+            // `any` is no more than what a parameter without a type has, and a callback can have a type from its context.
+            let is_typed = !is_annotated && !services.type_flags(ty).contains(TypeFlags::ANY);
             parameters.push(ParameterType {
                 binding: hir[parameter.pat].pos,
-                text: match is_annotated {
-                    true => None,
-                    false => text_that_names_nothing(services, ty),
+                text: match is_typed {
+                    true => text_that_names_nothing(services, ty),
+                    false => None,
                 },
                 is_of_default: !is_annotated
                     && hir.type_assertion_operand(parameter.default).is_some()
