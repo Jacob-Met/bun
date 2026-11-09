@@ -372,10 +372,9 @@ pub(crate) fn typed_files_for_build(
         &found.declarations_while_checked,
         &newest_lib,
     );
-    // A type that the typed files have for a moved default value alone can be the error: the function body can have lost the types that agree with it.
-    let has_moved_default = |module: &ModuleTypes| !module.parameters.is_empty();
+    // A type that the typed files have for a moved default value can be the one error: the function body can have lost the types that agree with it.
     if first_error(&report).is_some()
-        && modules.iter().any(has_moved_default)
+        && found.moved_defaults
         && let Ok(without) = build(&emitted_modules, TypesOfDefaults::LeftOut)
     {
         found = without;

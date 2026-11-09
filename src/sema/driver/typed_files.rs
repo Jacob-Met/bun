@@ -1569,6 +1569,7 @@ fn outermost_only(mut slots: Vec<Slot>, regions: &[(u32, u32)]) -> Vec<Slot> {
 struct TypedText {
     text: Vec<u8>,
     dropped_casts: usize,
+    moved_defaults: bool,
     has_default_export: bool,
     modules_of_untyped_values: Vec<Vec<u8>>,
     source: Option<Vec<u8>>,
@@ -3234,6 +3235,8 @@ struct MovedDefaults {
     annotations: FxHashMap<(u32, u32), (Vec<u8>, (u32, u32))>,
     /// Where a source has a cast or an enum member that `copy_casts` found no place for in the output.
     lost_casts: Vec<(u32, u32)>,
+    /// One is of a module that is checked: a typed file can say more of it than that the parameter can be left out.
+    has_types: bool,
 }
 
 impl MovedDefaults {
@@ -3344,6 +3347,7 @@ impl<'a> Transfer<'_, 'a, '_> {
                 if let Some(&default) = default {
                     // A pattern has its annotation in the function body, and what is not checked has no types.
                     let module = checked.filter(|_| default.is_name);
+                    moved.has_types |= module.is_some();
                     let noted = module.and_then(|module| module.types?.parameter(key));
                     let annotated = module.zip(found).zip(default.annotation.some());
                     let text = match (annotated, default.is_before_required) {
@@ -4432,6 +4436,7 @@ impl<'a> Transfer<'_, 'a, '_> {
         Ok(TypedText {
             text,
             dropped_casts: self.dropped_casts,
+            moved_defaults: self.moved_defaults.has_types,
             has_default_export,
             modules_of_untyped_values: self.linked.modules_of_untyped_values.clone(),
             source: None,
@@ -5025,6 +5030,8 @@ pub struct TypedFiles {
     pub typed: Vec<(Vec<u8>, Vec<u8>)>,
     pub declarations_while_checked: Vec<(Vec<u8>, Vec<u8>)>,
     pub dropped_casts: usize,
+    /// The output has a default value in a function body that [`TypesOfDefaults`] is about.
+    pub moved_defaults: bool,
 }
 
 fn inside<'a>(directory: &[u8], path: &'a [u8]) -> Option<&'a [u8]> {
@@ -5200,6 +5207,7 @@ pub fn build_typed_files(
         typed: Vec::new(),
         declarations_while_checked: Vec::new(),
         dropped_casts: 0,
+        moved_defaults: false,
     };
     for (output, (typed_path, typed)) in outputs.iter().zip(typed_outputs(
         outdir,
@@ -5213,6 +5221,7 @@ pub fn build_typed_files(
                 .to_vec()
         };
         found.dropped_casts += typed.dropped_casts;
+        found.moved_defaults |= typed.moved_defaults;
         found
             .modules_of_untyped_values
             .extend(typed.modules_of_untyped_values);
