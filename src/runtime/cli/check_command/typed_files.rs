@@ -14,8 +14,8 @@ use bun_sema::session::Session;
 use bun_sema::util::SharedSort;
 use bun_sema_driver::host::{Disk, Provided, from_native};
 use bun_sema_driver::typed_files::{
-    ModuleTypes, Output, annotate_implicit_any, build_typed_files, emitted_declarations_of,
-    module_types, tsconfig_of_sources, typed_path_beside,
+    ModuleTypes, Output, Unannotated, annotate_implicit_any, build_typed_files,
+    emitted_declarations_of, module_types, tsconfig_of_sources, typed_path_beside,
 };
 use bun_sema_driver::{Diagnostic, PlanOptions, Report, Request};
 use bun_threading::Guarded;
@@ -307,7 +307,10 @@ pub(crate) fn typed_files_for_build(
             }
         }
     };
-    let without_emitted_declarations = build_typed_files(outdir, &outputs, modules, &[]);
+    let build = |emitted: &[ModuleTypes], unannotated| {
+        build_typed_files(outdir, &outputs, modules, emitted, unannotated)
+    };
+    let without_emitted_declarations = build(&[], Unannotated::Typed);
     let untyped_modules = without_emitted_declarations
         .as_ref()
         .map_or(&[][..], |found| &found.modules_of_untyped_values[..]);
@@ -350,7 +353,7 @@ pub(crate) fn typed_files_for_build(
     let emitted_modules = emitted_modules.take();
     let found = match emitted_modules.is_empty() {
         true => without_emitted_declarations,
-        false => build_typed_files(outdir, &outputs, modules, &emitted_modules),
+        false => build(&emitted_modules, Unannotated::Typed),
     };
     let mut warn = |why: core::fmt::Arguments<'_>| {
         log.add_warning_fmt(
@@ -364,11 +367,27 @@ pub(crate) fn typed_files_for_build(
         Ok(found) => found,
         Err(why) => return warn(format_args!("{why}")),
     };
-    let report = check(
+    let mut report = check(
         &mut found.typed,
         &found.declarations_while_checked,
         &newest_lib,
     );
+    // A type that a parameter has from its default value alone can be the error: the function body can have lost the types that agree with it.
+    let types_a_default = |module: &ModuleTypes| {
+        let mut noted = module.parameters.iter();
+        noted.any(|noted| noted.text.is_some() || noted.is_of_default)
+    };
+    if first_error(&report).is_some()
+        && modules.iter().any(types_a_default)
+        && let Ok(untyped) = build(&emitted_modules, Unannotated::Untyped)
+    {
+        found = untyped;
+        report = check(
+            &mut found.typed,
+            &found.declarations_while_checked,
+            &newest_lib,
+        );
+    }
     if let Some(first) = first_error(&report) {
         let path = bundler_path(&first.path);
         let separator = std::path::MAIN_SEPARATOR_STR.as_bytes();
