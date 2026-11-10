@@ -54,12 +54,8 @@ async function spawned(cmd: string[], cwd: string, env: Record<string, string | 
 // app.ts, index.aot.ts and version.aot.ts are compiled with their types, and the build has nothing to say about them.
 const USED = { said: [], typedFiles: 3, exitCode: 0, signal: null, stdout: "7 1.2.3\n" };
 
-async function install(root: string) {
-  const built = await spawned(
-    [bunExe(), "compile", "--library", "src/index.ts", "src/version.ts"],
-    join(root, "library"),
-    env,
-  );
+async function install(root: string, args = ["src/index.ts", "src/version.ts"]) {
+  const built = await spawned([bunExe(), "compile", "--library", ...args], join(root, "library"), env);
   expect({ stderr: built.stderr, exitCode: built.exitCode }).toEqual({ stderr: "", exitCode: 0 });
   cpSync(join(root, "library/dist"), join(root, "app/node_modules/shapes"), { recursive: true });
 }
@@ -127,6 +123,60 @@ export function area(shape: Shape): Sizes.Size {
     });
     await install(String(dir));
     expect(await compile(String(dir))).toEqual(USED);
+  });
+
+  // The React Compiler prints `(first = 1)` as `(t0) { let first = t0 === undefined ? 1 : t0`.
+  test("a call may leave out a parameter whose default value the React Compiler moved into the function", async () => {
+    using dir = tempDir("aot-library-typed-file-moved-default", {
+      "library/tsconfig.json": tsconfig,
+      "library/package.json": JSON.stringify({ name: "shapes", version: "1.2.3" }),
+      "library/src/state.ts": `export function useState<T>(initial: T): [T] {\n  return [initial];\n}\n`,
+      "library/src/index.tsx": `import { useState } from "./state";
+export enum Unit {
+  Px,
+  Em,
+}
+function same<T>(value: T): T {
+  return value;
+}
+export function useBoth(first: number = 1, second = 2): number {
+  const [value] = useState(first);
+  return value + second;
+}
+export function useRange(first: number = 1, start = 0, end: number): number {
+  const [value] = useState(first);
+  return value + start + end;
+}
+export function useSigned(first: number = 1, second: typeof first = 2, run: typeof same<number> = same): number {
+  const [value] = useState(first);
+  return value + run(second);
+}
+export function useCast(first = 1, unit = Unit.Px as Unit | null, known = (Unit.Em as Unit | null)!): string {
+  const [value] = useState(first);
+  return value + String(unit) + Unit[known];
+}
+export function useMapped<T extends { id: number }>(items: T[], first = 1): Array<T | null> {
+  const [value] = useState(first);
+  const pick = (item: T, fallback = null as T | null): T | null => (item.id > 0 ? item : fallback);
+  const mapped = items.map(item => pick(item));
+  return value > 0 ? mapped : [];
+}
+`,
+      "app/tsconfig.json": tsconfig,
+      "app/package.json": library["app/package.json"],
+      // A function with a `typeof` of a parameter in its signature takes every parameter, as its typed file says.
+      "app/app.ts": `import { Unit, useBoth, useCast, useMapped, useRange, useSigned } from "shapes";
+console.log(useBoth(), useBoth(5), useBoth(5, 6), useBoth(undefined, 6));
+console.log(useRange(undefined, undefined, 5), useRange(1, 2, 3), useRange(undefined, 2, 3));
+console.log(useSigned(1, 2, value => value + 1));
+console.log(useCast(), useCast(1, null, Unit.Em), useCast(undefined, Unit.Em, undefined));
+console.log(JSON.stringify(useMapped([{ id: 1 }, { id: 0 }])), JSON.stringify(useMapped([{ id: 2 }], 0)));
+`,
+    });
+    await install(String(dir), ["src/index.tsx", "--react-compiler"]);
+    const stdout = `3 7 11 7\n6 6 6\n4\n10Em 1nullEm 11Em\n[{"id":1},null] []\n`;
+    expect(await compile(String(dir))).toEqual({ ...USED, typedFiles: 2, stdout });
+    expect(await spawned([bunExe(), "app.ts"], join(String(dir), "app"), env)).toMatchObject({ stdout, exitCode: 0 });
   });
 
   test("does not read index.js, so a change to it reaches plain Bun alone", async () => {

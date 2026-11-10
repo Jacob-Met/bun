@@ -14,8 +14,8 @@ use bun_sema::session::Session;
 use bun_sema::util::SharedSort;
 use bun_sema_driver::host::{Disk, Provided, from_native};
 use bun_sema_driver::typed_files::{
-    ModuleTypes, Output, annotate_implicit_any, build_typed_files, emitted_declarations_of,
-    module_types, tsconfig_of_sources, typed_path_beside,
+    ModuleTypes, Output, TypesOfDefaults, annotate_implicit_any, build_typed_files,
+    emitted_declarations_of, module_types, tsconfig_of_sources, typed_path_beside,
 };
 use bun_sema_driver::{Diagnostic, PlanOptions, Report, Request};
 use bun_threading::Guarded;
@@ -69,17 +69,21 @@ pub(crate) fn warn_about_skipped_typed_files(option: &str, log: &mut bun_ast::Lo
 pub(super) struct NotedModuleTypes(Guarded<Vec<(u32, ModuleTypes)>>);
 
 impl NotedModuleTypes {
-    pub(super) fn note(&self, checker: &mut Checker<'_, '_>, file: FileId) {
-        self.note_if(checker, file, |_| true);
+    /// `notes_parameters`: see [`module_types`].
+    pub(super) fn note(&self, checker: &mut Checker<'_, '_>, file: FileId, notes_parameters: bool) {
+        if let Some(found) = module_types(checker, file, notes_parameters) {
+            self.replace(file, found);
+        }
     }
 
+    // A declaration file has no default values.
     fn note_if(
         &self,
         checker: &mut Checker<'_, '_>,
         file: FileId,
         is_wanted: impl Fn(&ModuleTypes) -> bool,
     ) {
-        if let Some(found) = module_types(checker, file).filter(is_wanted) {
+        if let Some(found) = module_types(checker, file, false).filter(is_wanted) {
             self.replace(file, found);
         }
     }
@@ -303,7 +307,10 @@ pub(crate) fn typed_files_for_build(
             }
         }
     };
-    let without_emitted_declarations = build_typed_files(outdir, &outputs, modules, &[]);
+    let build = |emitted: &[ModuleTypes], types_of_defaults| {
+        build_typed_files(outdir, &outputs, modules, emitted, types_of_defaults)
+    };
+    let without_emitted_declarations = build(&[], TypesOfDefaults::Written);
     let untyped_modules = without_emitted_declarations
         .as_ref()
         .map_or(&[][..], |found| &found.modules_of_untyped_values[..]);
@@ -346,7 +353,7 @@ pub(crate) fn typed_files_for_build(
     let emitted_modules = emitted_modules.take();
     let found = match emitted_modules.is_empty() {
         true => without_emitted_declarations,
-        false => build_typed_files(outdir, &outputs, modules, &emitted_modules),
+        false => build(&emitted_modules, TypesOfDefaults::Written),
     };
     let mut warn = |why: core::fmt::Arguments<'_>| {
         log.add_warning_fmt(
@@ -360,11 +367,23 @@ pub(crate) fn typed_files_for_build(
         Ok(found) => found,
         Err(why) => return warn(format_args!("{why}")),
     };
-    let report = check(
+    let mut report = check(
         &mut found.typed,
         &found.declarations_while_checked,
         &newest_lib,
     );
+    // A type that the typed files have for a moved default value can be the one error: the function body can have lost the types that agree with it.
+    if first_error(&report).is_some()
+        && found.moved_defaults
+        && let Ok(without) = build(&emitted_modules, TypesOfDefaults::LeftOut)
+    {
+        found = without;
+        report = check(
+            &mut found.typed,
+            &found.declarations_while_checked,
+            &newest_lib,
+        );
+    }
     if let Some(first) = first_error(&report) {
         let path = bundler_path(&first.path);
         let separator = std::path::MAIN_SEPARATOR_STR.as_bytes();

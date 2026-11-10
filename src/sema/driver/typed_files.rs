@@ -3,8 +3,8 @@ use bun_ast::op::Level;
 use bun_sema::atom::Interner;
 use bun_sema::check::Checker;
 use bun_sema::check::services::{
-    Child, LiteralValue, NodeRef, Services, SymbolFlags, SymbolOp, SymbolRef, SymbolTable,
-    TypeFlags, TypeFormatFlags,
+    Child, LiteralValue, NodeRef, Relation, Services, SymbolFlags, SymbolOp, SymbolRef,
+    SymbolTable, TypeFlags, TypeFormatFlags,
 };
 use bun_sema::check::spans::{compute_ecma_line_starts, skip_trivia, skip_trivia_back, token_end};
 use bun_sema::config::find_config_of_package;
@@ -37,9 +37,21 @@ enum Place {
     TypeArguments,
 }
 
+/// The output can have a default value in the function body: `(a = 1)` as `(t0) { let a = t0 === undefined ? 1 : t0`.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+enum Parameter {
+    /// No parameter, or a pattern or a rest parameter without a default value: nothing that can take a `?`.
+    Other,
+    /// `a = 1`
+    WithDefault,
+    /// `a`, `a?: T`
+    Name,
+}
+
 #[derive(Copy, Clone, Debug)]
 struct Slot {
     place: Place,
+    parameter: Parameter,
     key: u32,
     start: u32,
     end: u32,
@@ -49,11 +61,23 @@ impl Slot {
     fn new(place: Place, key: u32, (start, end): (u32, u32)) -> Slot {
         Slot {
             place,
+            parameter: Parameter::Other,
             key,
             start,
             end,
         }
     }
+}
+
+/// A parameter that has a default value in the source.
+#[derive(Copy, Clone)]
+struct DefaultedParameter {
+    function: FnId,
+    annotation: TypeNodeId,
+    value: ExprId,
+    is_name: bool,
+    /// A `?` on it is an error: a parameter behind it has to be passed.
+    is_before_required: bool,
 }
 
 fn level_of_operator(op: BinOp) -> Level {
@@ -157,6 +181,16 @@ fn parse<'s>(
     } else {
         ScriptKind::Ts
     };
+    parse_as(session, atoms, path, text, kind)
+}
+
+fn parse_as<'s>(
+    session: &'s Session,
+    atoms: &Interner<'s>,
+    path: &[u8],
+    text: &[u8],
+    kind: ScriptKind,
+) -> Result<File<'s>, TypedFilesError> {
     let file = bun_sema_parser::summarize_as(
         Dialect::default(),
         session.arena(),
@@ -179,6 +213,95 @@ fn parse<'s>(
     }
 }
 
+/// Whether the parameter at `at` is a pattern or a name before `=`: it can have a default value and no slot.
+fn may_have_default_without_slot(text: &[u8], at: u32) -> bool {
+    let at = at as usize;
+    if matches!(text.get(at), Some(b'{' | b'[')) {
+        return true;
+    }
+    let after = skip_trivia(text, token_end(text, at, false));
+    text.get(after) == Some(&b'=') && token_end(text, after, false) == after + 1
+}
+
+/// `T` where `value` is `x as T`, also under `satisfies` or `!`, and whether it is under a `!`.
+fn asserted_type(file: &File<'_>, mut value: ExprId) -> Option<(TypeNodeId, bool)> {
+    let mut is_non_null = false;
+    loop {
+        match file[value].kind {
+            ExprKind::As { ty, .. } => return Some((ty, is_non_null)),
+            ExprKind::Satisfies { expr, .. } => value = expr,
+            ExprKind::NonNull(expr) => (value, is_non_null) = (expr, true),
+            _ => return None,
+        }
+    }
+}
+
+/// The variable that holds each moved default value, by its parameter: `a` of `let a = t0 === undefined ? 1 : t0`.
+fn variables_of_moved_defaults<'a>(
+    output: &Syntax<'a, '_>,
+    mappings: &Mappings,
+) -> FxHashMap<(u32, u32), &'a [u8]> {
+    let mut found = FxHashMap::default();
+    for statement in output.file.stmts.iter() {
+        let StmtKind::Var(declarations) = statement.kind else {
+            continue;
+        };
+        for (place, id) in declarations.iter().enumerate() {
+            let declaration: &VarDecl = &output.file[id];
+            let name = &output.file[declaration.pat];
+            // The source map has no place for the name of the first variable of a statement, and has one for the statement.
+            let of_statement = || mappings.original(statement.start).filter(|_| place == 0);
+            let mapped = mappings.original(name.pos).or_else(of_statement);
+            if let Some(parameter) = mapped.filter(|_| matches!(name.kind, PatKind::Ident(_))) {
+                found
+                    .entry(parameter)
+                    .or_insert_with(|| output.word(name.pos));
+            }
+        }
+    }
+    found
+}
+
+/// Each parameter that has a default value, by where it starts. None of a function whose signature has a `typeof` of one.
+fn defaulted_parameters(
+    syntax: &Syntax<'_, '_>,
+    locals: &[(u32, u32)],
+) -> FxHashMap<u32, DefaultedParameter> {
+    let file = syntax.file;
+    let mut found = FxHashMap::default();
+    // A `set` accessor takes no `?` (TS1051).
+    let functions = (file.fns.iter().zip(0u32..)).filter(|(function, _)| {
+        Syntax::has_javascript(function) && function.kind != FnKind::Setter
+    });
+    for (function, id) in functions {
+        let last_required = file.last_required_parameter(function.params);
+        let parameters = function.params.iter().map(|parameter| &file[parameter]);
+        for (place, parameter) in parameters.enumerate() {
+            if parameter.default.is_some() {
+                found.insert(
+                    file[parameter.pat].pos,
+                    DefaultedParameter {
+                        function: FnId(id),
+                        annotation: parameter.ty,
+                        value: parameter.default,
+                        is_name: matches!(file[parameter.pat].kind, PatKind::Ident(_)),
+                        is_before_required: last_required.is_some_and(|last| place < last),
+                    },
+                );
+            }
+        }
+    }
+    // There `typeof a` is the type of the parameter `a` as the source has it: with its default value, and no `undefined`.
+    let queried: FxHashSet<FnId> = (locals.iter())
+        .filter_map(|&(at, binding)| {
+            let function = found.get(&binding)?.function;
+            syntax.is_in_signature(function, at).then_some(function)
+        })
+        .collect();
+    found.retain(|_, parameter| !queried.contains(&parameter.function));
+    found
+}
+
 impl<'a, 's> Syntax<'a, 's> {
     fn after_trivia(&self, at: u32) -> u32 {
         skip_trivia(self.text, at as usize) as u32
@@ -186,6 +309,23 @@ impl<'a, 's> Syntax<'a, 's> {
 
     fn before_trivia(&self, at: u32) -> u32 {
         skip_trivia_back(self.text, at as usize) as u32
+    }
+
+    /// Whether `at` is before the body of `function`, and in no default value: the output has those in the body.
+    fn is_in_signature(&self, id: FnId, at: u32) -> bool {
+        let function = &self.file[id];
+        let body = match function.kind {
+            FnKind::Arrow => Some(function.anchor),
+            _ => self.body_start(id),
+        };
+        let is_in_default = function.params.iter().any(|parameter| {
+            let default = self.file[parameter].default;
+            default.is_some() && {
+                let (start, end) = self.outer_span(default);
+                (start..end).contains(&at)
+            }
+        });
+        body.is_some_and(|body| at < body) && !is_in_default
     }
 
     fn byte(&self, at: u32) -> u8 {
@@ -303,6 +443,32 @@ impl<'a, 's> Syntax<'a, 's> {
             None => start,
         };
         Some(Slot::new(Place::Binding, key, (start, end)))
+    }
+
+    /// Whether the name at `at` is a parameter with no default value: the output can have one in the function body.
+    fn is_plain_parameter(&self, at: u32) -> bool {
+        let mut parameters = self.file.params.iter();
+        let parameter = parameters.find(|parameter| self.file[parameter.pat].pos == at);
+        parameter.is_some_and(|parameter| self.parameter_shape(parameter) == Parameter::Name)
+    }
+
+    fn parameter_shape(&self, parameter: &Param) -> Parameter {
+        let is_name = matches!(self.file[parameter.pat].kind, PatKind::Ident(_));
+        if parameter.default.is_some() {
+            Parameter::WithDefault
+        } else if is_name && !parameter.flags.contains(Flags::REST) {
+            Parameter::Name
+        } else {
+            Parameter::Other
+        }
+    }
+
+    /// `T | undefined` reads as another type for these: `() => void | undefined`.
+    fn is_parenthesized_in_a_union(&self, annotation: TypeNodeId) -> bool {
+        matches!(
+            self.file[annotation].kind,
+            TypeNodeKind::Fn(_) | TypeNodeKind::Cond { .. }
+        )
     }
 
     fn function_slots(&self, id: FnId, slots: &mut Vec<Slot>) {
@@ -574,11 +740,15 @@ impl<'a, 's> Syntax<'a, 's> {
             .collect();
         for (index, parameter) in file.params.iter().enumerate() {
             if !this_parameters.contains(&(index as u32)) {
-                slots.extend(self.binding_slot(
+                let binding = self.binding_slot(
                     parameter.pat,
                     parameter.ty,
                     parameter.flags.contains(Flags::OPTIONAL),
-                ));
+                );
+                slots.extend(binding.map(|slot| Slot {
+                    parameter: self.parameter_shape(parameter),
+                    ..slot
+                }));
             }
         }
         for index in 0..file.fns.len() {
@@ -1399,6 +1569,7 @@ fn outermost_only(mut slots: Vec<Slot>, regions: &[(u32, u32)]) -> Vec<Slot> {
 struct TypedText {
     text: Vec<u8>,
     dropped_casts: usize,
+    moved_defaults: bool,
     has_default_export: bool,
     modules_of_untyped_values: Vec<Vec<u8>>,
     source: Option<Vec<u8>>,
@@ -1408,6 +1579,7 @@ struct Bundle<'a> {
     modules: &'a [ModuleTypes],
     emitted_declarations: &'a [ModuleTypes],
     entry_point: Option<&'a [u8]>,
+    types_of_defaults: TypesOfDefaults,
 }
 
 struct Written<'a, 's> {
@@ -1439,6 +1611,22 @@ impl Written<'_, '_> {
 
     fn trimmed_text(&self, start: u32, end: u32) -> Vec<u8> {
         self.text(start, end).trim_ascii().to_vec()
+    }
+
+    /// The text of a slot whose type starts at `annotation`, as one that takes `undefined` too: `: T | undefined`.
+    fn text_with_undefined(&self, slot: &Slot, annotation: u32, is_parenthesized: bool) -> Vec<u8> {
+        let (open, close): (&[u8], &[u8]) = if is_parenthesized {
+            (b" (", b") | undefined")
+        } else {
+            (b" ", b" | undefined")
+        };
+        [
+            &self.trimmed_text(slot.start, annotation)[..],
+            open,
+            &self.trimmed_text(annotation, slot.end),
+            close,
+        ]
+        .concat()
     }
 
     fn types_of_namespace(&self, id: StmtId, dropped_modifiers: Flags) -> Option<Vec<u8>> {
@@ -1946,6 +2134,8 @@ struct Linked {
     modules_of_untyped_values: Vec<Vec<u8>>,
     emitted_enums: FxHashMap<(u32, u32), Vec<u8>>,
     enum_names: FxHashMap<(u32, u32), Vec<u8>>,
+    /// The functions whose parameters stay as the output has them, though it has their default values in the body.
+    kept_parameters: FxHashSet<(u32, FnId)>,
 }
 
 fn link(
@@ -2489,6 +2679,7 @@ fn link(
         .collect();
     let mut pending_pairs: Vec<&[u8]> = Vec::new();
     let mut all_edits: Vec<Vec<(u32, u32, Vec<u8>)>> = Vec::new();
+    let mut default_variables = None;
     for (index, module) in written.iter().enumerate() {
         let mut edits: Vec<(u32, u32, Vec<u8>)> = Vec::new();
         if let Some((module, types)) = module
@@ -2629,12 +2820,29 @@ fn link(
                     }
                 }
             }
+            let mut defaults = None;
             for &(at, binding) in types.locals.iter().filter(|_| index < mapped) {
-                if let Some(new) = generated
-                    .get(&(index as u32, binding))
-                    .map(|&offset| output.word(offset))
-                    .filter(|new| *new != syntax.word(at))
-                {
+                let Some(&offset) = generated.get(&(index as u32, binding)) else {
+                    continue;
+                };
+                // `typeof a` in a function whose output has the default value of `a` in its body.
+                let moved = types.parameter(binding).and_then(|_| {
+                    let defaults =
+                        defaults.get_or_insert_with(|| defaulted_parameters(syntax, &types.locals));
+                    let function = defaults.get(&binding)?.function;
+                    output.is_plain_parameter(offset).then_some(function)
+                });
+                let variable = moved.and_then(|_| {
+                    let variables = default_variables
+                        .get_or_insert_with(|| variables_of_moved_defaults(output, mappings));
+                    variables.get(&(index as u32, binding)).copied()
+                });
+                // The variable that holds the default value has the type of `a`. Without one, only the parameter as it is has.
+                if let (Some(function), None) = (moved, variable) {
+                    linked.kept_parameters.insert((index as u32, function));
+                }
+                let new = variable.unwrap_or_else(|| output.word(offset));
+                if new != syntax.word(at) {
                     edits.push((at, syntax.token_end(at), new.to_vec()));
                 }
             }
@@ -2930,13 +3138,12 @@ fn add_types(
                 .some()
                 .filter(|_| parameter.flags.contains(Flags::OPTIONAL))
             {
-                let is_parenthesized_in_a_union = matches!(
-                    file[annotation].kind,
-                    TypeNodeKind::Fn(_) | TypeNodeKind::Cond { .. }
-                );
                 optional_parameter_properties.insert(
                     (index as u32, binding.key),
-                    (syntax.type_span(annotation).0, is_parenthesized_in_a_union),
+                    (
+                        syntax.type_span(annotation).0,
+                        syntax.is_parenthesized_in_a_union(annotation),
+                    ),
                 );
             }
             for modifier in file.modifier_list(file.param_modifiers(ParamId(id))) {
@@ -2950,12 +3157,11 @@ fn add_types(
                 };
                 source_slots.insert(
                     (place, index as u32, binding.key),
-                    Slot {
+                    Slot::new(
                         place,
-                        key: binding.key,
-                        start: modifier.pos,
-                        end: syntax.token_end(modifier.pos),
-                    },
+                        binding.key,
+                        (modifier.pos, syntax.token_end(modifier.pos)),
+                    ),
                 );
             }
         }
@@ -2987,6 +3193,7 @@ fn add_types(
         javascript,
         output: &output,
         mappings: &mappings,
+        sources,
         modules: &written[..sources.len()],
         linked: &linked,
         type_references,
@@ -2994,10 +3201,13 @@ fn add_types(
         dropped_casts: 0,
         hoisted: Vec::new(),
         optional_parameter_properties,
+        types_of_defaults: bundle.types_of_defaults,
+        moved_defaults: MovedDefaults::default(),
     };
-    transfer.copy_slots(&source_slots);
+    transfer.copy_slots(&source_slots, &session, &atoms);
     transfer.annotate_generated_code();
     transfer.copy_casts();
+    transfer.copy_to_moved_defaults();
     transfer.type_enum_and_namespace_objects();
     transfer.copy_statements();
     transfer.copy_directives();
@@ -3005,10 +3215,43 @@ fn add_types(
     transfer.finish()
 }
 
+/// The types that a typed file has for a default value that the output has in a function body.
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub enum TypesOfDefaults {
+    /// The annotation of the parameter on the variable that holds the value, and the type of the value on a parameter without one.
+    Written,
+    /// Neither. The typed files did not check with them: the function body can have lost a type that agrees with them.
+    LeftOut,
+}
+
+/// The parameters whose default value the output has in the function body. Nothing is in here for a build that moves none.
+#[derive(Default)]
+struct MovedDefaults {
+    /// [`defaulted_parameters`] of each source that one was looked for in.
+    of_sources: FxHashMap<u32, FxHashMap<u32, DefaultedParameter>>,
+    /// Each that `copy_slots` gave no type, with where, and whether a `?` is an error there. `copy_casts` can find its type.
+    untyped: FxHashMap<(u32, u32), (u32, bool)>,
+    /// The annotation of each parameter that has one, for the variable that its default value is now stored to, and where that value is.
+    annotations: FxHashMap<(u32, u32), (Vec<u8>, (u32, u32))>,
+    /// Where a source has a cast or an enum member that `copy_casts` found no place for in the output.
+    lost_casts: Vec<(u32, u32)>,
+    /// One is of a module that is checked: a typed file can say more of it than that the parameter can be left out.
+    has_types: bool,
+}
+
+impl MovedDefaults {
+    fn note_lost_cast(&mut self, source: u32, at: u32) {
+        if !self.annotations.is_empty() {
+            self.lost_casts.push((source, at));
+        }
+    }
+}
+
 struct Transfer<'t, 'a, 's> {
     javascript: &'a [u8],
     output: &'t Syntax<'a, 's>,
     mappings: &'t Mappings,
+    sources: &'t [Source<'a>],
     modules: &'t [Option<Written<'a, 's>>],
     linked: &'t Linked,
     type_references: FxHashSet<(&'t [u8], &'t [u8])>,
@@ -3016,6 +3259,8 @@ struct Transfer<'t, 'a, 's> {
     dropped_casts: usize,
     hoisted: Vec<u8>,
     optional_parameter_properties: FxHashMap<(u32, u32), (u32, bool)>,
+    types_of_defaults: TypesOfDefaults,
+    moved_defaults: MovedDefaults,
 }
 
 impl<'a> Transfer<'_, 'a, '_> {
@@ -3030,10 +3275,17 @@ impl<'a> Transfer<'_, 'a, '_> {
         anchored
     }
 
-    fn copy_slots(&mut self, source_slots: &FxHashMap<(Place, u32, u32), Slot>) {
+    fn copy_slots<'p>(
+        &mut self,
+        source_slots: &FxHashMap<(Place, u32, u32), Slot>,
+        session: &'p Session,
+        atoms: &Interner<'p>,
+    ) {
         let (output, mappings, written, linked) =
             (self.output, self.mappings, self.modules, self.linked);
         let (output_file, insertions) = (output.file, &mut self.insertions);
+        let (sources, moved) = (self.sources, &mut self.moved_defaults);
+        let types_of_defaults = self.types_of_defaults;
         let parameter_count_of: FxHashMap<u32, usize> = output_file
             .fns
             .iter()
@@ -3061,17 +3313,97 @@ impl<'a> Transfer<'_, 'a, '_> {
                 );
                 continue;
             }
-            let Some(module) = written[source as usize]
-                .as_ref()
-                .filter(|module| !module.is_unchecked())
-            else {
-                continue;
-            };
-            let Some(found) = source_slots.get(&(slot.place, source, key)) else {
+            let module = written[source as usize].as_ref();
+            let checked = module.filter(|module| !module.is_unchecked());
+            let is_name = slot.parameter == Parameter::Name;
+            // The slot of a parameter says whether it has a default value, in a module that is not checked too.
+            let found = (if is_name { module } else { checked })
+                .and_then(|_| source_slots.get(&(slot.place, source, key)));
+            if is_name
+                && match found {
+                    Some(found) => found.parameter == Parameter::WithDefault,
+                    None => may_have_default_without_slot(sources[source as usize].text, key),
+                }
+            {
+                let of_source = moved.of_sources.entry(source);
+                let parameters = of_source.or_insert_with(|| match module {
+                    Some(module) => {
+                        let locals = module.types.map_or(&[][..], |types| &types.locals[..]);
+                        defaulted_parameters(&module.syntax, locals)
+                    }
+                    // JavaScript is parsed only where the output may have moved a default value of it.
+                    None => {
+                        let Source { path, text } = sources[source as usize];
+                        let parsed = parse_as(session, atoms, path, text, ScriptKind::Jsx);
+                        parsed.map_or_else(
+                            |_| FxHashMap::default(),
+                            |file| defaulted_parameters(&Syntax { file: &file, text }, &[]),
+                        )
+                    }
+                });
+                let default = parameters.get(&key).filter(|default| {
+                    !(linked.kept_parameters).contains(&(source, default.function))
+                });
+                if let Some(&default) = default {
+                    // A pattern has its annotation in the function body, and what is not checked has no types.
+                    let module = checked.filter(|_| default.is_name);
+                    moved.has_types |= module.is_some();
+                    let noted = module.and_then(|module| module.types?.parameter(key));
+                    let annotated = module.zip(found).zip(default.annotation.some());
+                    let text = match (annotated, default.is_before_required) {
+                        (Some(((module, found), annotation)), is_before_required) => {
+                            let text = module.trimmed_text(found.start, found.end);
+                            let with_undefined = is_before_required.then(|| {
+                                module.text_with_undefined(
+                                    found,
+                                    module.syntax.type_span(annotation).0,
+                                    module.syntax.is_parenthesized_in_a_union(annotation),
+                                )
+                            });
+                            let optional = || [&b"?"[..], &text].concat();
+                            let written = with_undefined.unwrap_or_else(optional);
+                            // An annotation that takes `undefined` is not the type of the variable: see [`ParameterType`].
+                            if types_of_defaults == TypesOfDefaults::Written
+                                && !noted.is_some_and(|noted| noted.takes_undefined)
+                            {
+                                let value = module.syntax.outer_span(default.value);
+                                moved.annotations.insert((source, key), (text, value));
+                            }
+                            written
+                        }
+                        (None, is_before_required) => {
+                            // The checker says the type of a default value, if it names nothing. Only `copy_casts` knows whether the output has a cast.
+                            let is_cast = module.is_some_and(|module| {
+                                let file = module.syntax.file;
+                                file.type_assertion_operand(default.value).is_some()
+                            });
+                            let noted = noted
+                                .filter(|_| {
+                                    types_of_defaults == TypesOfDefaults::Written && !is_cast
+                                })
+                                .and_then(|noted| noted.text.as_deref());
+                            if noted.is_none() && module.is_some() {
+                                let place = (slot.start, is_before_required);
+                                moved.untyped.insert((source, key), place);
+                            }
+                            match (noted, is_before_required) {
+                                (Some(noted), true) => {
+                                    [&b": "[..], noted, b" | undefined"].concat()
+                                }
+                                (Some(noted), false) => [&b"?: "[..], noted].concat(),
+                                (None, true) => Vec::new(),
+                                (None, false) => b"?".to_vec(),
+                            }
+                        }
+                    };
+                    insertions.add(slot.start, Order::Slot, text);
+                    continue;
+                }
+            }
+            let (Some(module), Some(found)) = (checked, found) else {
+                let types = checked.and_then(|module| module.types);
                 if slot.place == Place::ReturnType
-                    && module
-                        .types
-                        .is_some_and(|types| types.functions_returning_undefined.contains(&key))
+                    && types.is_some_and(|types| types.functions_returning_undefined.contains(&key))
                 {
                     insertions.add(slot.start, Order::Slot, b": undefined".to_vec());
                 }
@@ -3094,21 +3426,8 @@ impl<'a> Transfer<'_, 'a, '_> {
                 {
                     let (annotation, is_parenthesized) =
                         self.optional_parameter_properties[&(source, key)];
-                    let (open, close): (&[u8], &[u8]) = if is_parenthesized {
-                        (b" (", b") | undefined")
-                    } else {
-                        (b" ", b" | undefined")
-                    };
-                    (
-                        Order::Slot,
-                        [
-                            &module.trimmed_text(found.start, annotation)[..],
-                            open,
-                            &module.trimmed_text(annotation, found.end),
-                            close,
-                        ]
-                        .concat(),
-                    )
+                    let text = module.text_with_undefined(found, annotation, is_parenthesized);
+                    (Order::Slot, text)
                 }
                 Place::Implements => (Order::Slot, [&b" "[..], &text[..]].concat()),
                 Place::ClassKeyword | Place::MemberName => {
@@ -3133,6 +3452,47 @@ impl<'a> Transfer<'_, 'a, '_> {
                 _ => (Order::Slot, text),
             };
             insertions.add(slot.start, order, text);
+        }
+    }
+
+    /// `let a: T = t0 === undefined ? [] : t0`. The source map has the parameter for such a statement, nothing for `a`.
+    fn copy_to_moved_defaults(&mut self) {
+        let (output_file, mappings) = (self.output.file, self.mappings);
+        let MovedDefaults {
+            annotations,
+            lost_casts,
+            ..
+        } = &self.moved_defaults;
+        if annotations.is_empty() {
+            return;
+        }
+        for statement in output_file.stmts.iter() {
+            let StmtKind::Var(declarations) = statement.kind else {
+                continue;
+            };
+            let Some(first) = declarations.iter().next() else {
+                continue;
+            };
+            let declaration: &VarDecl = &output_file[first];
+            let name = &output_file[declaration.pat];
+            if declaration.init.is_none()
+                || !matches!(name.kind, PatKind::Ident(_))
+                || mappings.original(name.pos).is_some()
+            {
+                continue;
+            }
+            let Some(parameter) = mappings.original(statement.start) else {
+                continue;
+            };
+            let Some((annotation, (start, end))) = annotations.get(&parameter) else {
+                continue;
+            };
+            // Without a cast that the source has, the default value can be of another type than the annotation.
+            let is_lost =
+                |&(source, at): &(u32, u32)| source == parameter.0 && (*start..*end).contains(&at);
+            if !lost_casts.iter().any(is_lost) {
+                (self.insertions).add(name.end, Order::Slot, annotation.clone());
+            }
         }
     }
 
@@ -3236,6 +3596,7 @@ impl<'a> Transfer<'_, 'a, '_> {
         let (output, mappings, written, linked) =
             (self.output, self.mappings, self.modules, self.linked);
         let (output_file, insertions) = (output.file, &mut self.insertions);
+        let types_of_defaults = self.types_of_defaults;
         let output_context = output.context();
         let mut output_expressions: FxHashMap<(Shape, u32, u32), ExprId> = FxHashMap::default();
         for index in 0..output_file.exprs.len() {
@@ -3426,6 +3787,8 @@ impl<'a> Transfer<'_, 'a, '_> {
                             .filter(|&literal| is_literal(literal))
                     })
                 }) else {
+                    self.moved_defaults
+                        .note_lost_cast(index as u32, source_position);
                     continue;
                 };
                 let member = enum_member_cast(chain.operand).filter(|_| is_literal(operand));
@@ -3438,6 +3801,8 @@ impl<'a> Transfer<'_, 'a, '_> {
                         != output.needs_parentheses(&output_context, operand, operand)
                 {
                     self.dropped_casts += 1;
+                    self.moved_defaults
+                        .note_lost_cast(index as u32, source_position);
                     continue;
                 }
                 let (start, end) = output.outer_span(operand);
@@ -3447,6 +3812,13 @@ impl<'a> Transfer<'_, 'a, '_> {
                     Level::Member
                 };
                 let (mut opens, mut suffix) = (0usize, Vec::new());
+                // The parameter that the output has this default value of in the function body, where `copy_slots` gave it no type.
+                let untyped = &self.moved_defaults.untyped;
+                let moved = (!untyped.is_empty())
+                    .then(|| widened.get(&chain.outermost))
+                    .flatten()
+                    .and_then(|&(_, key)| Some((key, *untyped.get(&(index as u32, key))?)));
+                let mut type_of_default = None;
                 if let Some(member) = member {
                     suffix.extend_from_slice(&member);
                     level = Level::Compare;
@@ -3457,7 +3829,21 @@ impl<'a> Transfer<'_, 'a, '_> {
                         declared,
                         linked.enum_names.get(&(index as u32, source_position)),
                     ) {
-                        insertions.add(declared, Order::Slot, [&b": "[..], name].concat());
+                        let is_typed = types_of_defaults == TypesOfDefaults::Written;
+                        // The parameter of a moved default value is typed below. With `--minify-syntax`, `declared` is the variable.
+                        let is_parameter =
+                            moved.is_some_and(|(_, (parameter, _))| parameter == declared);
+                        // Such a parameter takes the type of an `as`, and then its variable needs no enum.
+                        let kinds = || chain.casts.iter().map(|&cast| &syntax.file[cast].kind);
+                        let is_of_cast = is_typed
+                            && moved.is_some()
+                            && kinds().any(|kind| matches!(kind, ExprKind::As { .. }));
+                        if !is_of_cast && (is_typed || is_parameter) {
+                            type_of_default = moved.map(|_| name.to_vec());
+                        }
+                        if !is_of_cast && !is_parameter {
+                            insertions.add(declared, Order::Slot, [&b": "[..], name].concat());
+                        }
                     }
                 }
                 for &cast in &chain.casts {
@@ -3509,6 +3895,8 @@ impl<'a> Transfer<'_, 'a, '_> {
                 if shorthand_values.contains(&operand) {
                     if opens > 0 {
                         self.dropped_casts += 1;
+                        self.moved_defaults
+                            .note_lost_cast(index as u32, source_position);
                         continue;
                     }
                     insertions.add(
@@ -3523,6 +3911,39 @@ impl<'a> Transfer<'_, 'a, '_> {
                     vec![b'('; opens],
                 );
                 insertions.add(end, Order::Close(end - start), suffix);
+                let Some((key, (parameter, is_before_required))) = moved else {
+                    continue;
+                };
+                // The output has the casts of the default value now, so its parameter can have the type of it.
+                let noted = (module.types)
+                    .and_then(|types| Some((types, types.parameter(key)?)))
+                    .filter(|_| types_of_defaults == TypesOfDefaults::Written);
+                let asserted = noted
+                    .filter(|(_, noted)| noted.is_of_default)
+                    .and_then(|(types, _)| Some((types, asserted_type(file, chain.outermost)?)))
+                    .and_then(|(types, (asserted, is_non_null))| {
+                        let (start, end) = syntax.type_span(asserted);
+                        let is_function =
+                            is_before_required && syntax.is_parenthesized_in_a_union(asserted);
+                        // `(T) & {}` is `T` without `null` and `undefined`, as `(x as T)!` is.
+                        let (open, close): (&[u8], &[u8]) = match (is_non_null, is_function) {
+                            (true, _) => (b"(", b") & {}"),
+                            (false, true) => (b"(", b")"),
+                            (false, false) => (b"", b""),
+                        };
+                        // A `typeof a` in it can name a variable of the function body, which the parameter list does not have.
+                        let names_local =
+                            (types.locals.iter()).any(|&(at, _)| (start..end).contains(&at));
+                        (!names_local).then(|| [open, &module.text(start, end)[..], close].concat())
+                    });
+                let of_checker = || Some(noted?.1.text.as_deref()?.to_vec());
+                if let Some(ty) = type_of_default.or(asserted).or_else(of_checker) {
+                    let close: &[u8] = match is_before_required {
+                        true => b" | undefined",
+                        false => b"",
+                    };
+                    insertions.add(parameter, Order::Slot, [b": ", &ty[..], close].concat());
+                }
             }
         }
     }
@@ -3999,6 +4420,7 @@ impl<'a> Transfer<'_, 'a, '_> {
         Ok(TypedText {
             text,
             dropped_casts: self.dropped_casts,
+            moved_defaults: self.moved_defaults.has_types,
             has_default_export,
             modules_of_untyped_values: self.linked.modules_of_untyped_values.clone(),
             source: None,
@@ -4112,6 +4534,17 @@ pub enum Target {
     Module { path: Box<[u8]> },
 }
 
+/// What the type checker says of a parameter that has a default value.
+pub struct ParameterType {
+    pub binding: u32,
+    /// Its type where it has no annotation, if the text of that type names nothing.
+    pub text: Option<Box<[u8]>>,
+    /// It has no annotation and the type of its default value `x as T`. A callback can have another type from its context.
+    pub is_of_default: bool,
+    /// Its annotation takes `undefined`. The parameter is then of another type where the function starts.
+    pub takes_undefined: bool,
+}
+
 pub struct ModuleTypes {
     pub path: Box<[u8]>,
     pub text: Box<[u8]>,
@@ -4119,6 +4552,8 @@ pub struct ModuleTypes {
     pub enum_objects: Vec<u32>,
     pub exports: Vec<(Box<[u8]>, Target)>,
     pub constants: Vec<(u32, Box<[u8]>)>,
+    /// Each parameter that is a name with a default value, if the build can move default values. See [`module_types`].
+    pub parameters: Vec<ParameterType>,
     pub functions_returning_undefined: Vec<u32>,
     pub globals: Vec<u32>,
     pub augmented_modules: Vec<(u32, Box<[u8]>)>,
@@ -4132,6 +4567,10 @@ impl ModuleTypes {
             .iter()
             .find(|constant| constant.0 == binding)
             .map(|constant| &constant.1[..])
+    }
+
+    fn parameter(&self, binding: u32) -> Option<&ParameterType> {
+        (self.parameters.iter()).find(|parameter| parameter.binding == binding)
     }
 }
 
@@ -4257,7 +4696,12 @@ fn text_that_names_nothing(services: &mut Services<'_, '_, '_>, ty: TypeId) -> O
     })
 }
 
-pub fn module_types(checker: &mut Checker<'_, '_>, file: FileId) -> Option<ModuleTypes> {
+/// `notes_parameters`: the build can move a default value into the function body, as the React Compiler does.
+pub fn module_types(
+    checker: &mut Checker<'_, '_>,
+    file: FileId,
+    notes_parameters: bool,
+) -> Option<ModuleTypes> {
     if !is_project_source(checker, file) {
         return None;
     }
@@ -4422,6 +4866,43 @@ pub fn module_types(checker: &mut Checker<'_, '_>, file: FileId) -> Option<Modul
                 constants.push((hir[declaration.pat].pos, text));
             }
         }
+        let mut parameters = Vec::new();
+        let is_name = |pattern: PatId| {
+            let pattern = hir.pats.get(pattern.idx());
+            pattern.is_some_and(|pattern| matches!(pattern.kind, PatKind::Ident(_)))
+        };
+        let noted = if notes_parameters {
+            &hir.params[..]
+        } else {
+            &[]
+        };
+        let defaulted = (noted.iter().zip(0u32..))
+            .filter(|(parameter, _)| parameter.default.is_some() && is_name(parameter.pat));
+        for (parameter, id) in defaulted {
+            let ty = services.type_at_location(NodeRef {
+                file,
+                node: hir.node(ParamId(id)),
+            });
+            let default = NodeRef {
+                file,
+                node: hir.node(parameter.default),
+            };
+            let is_annotated = parameter.ty.is_some();
+            // `any` is no more than what a parameter without a type has, and a callback can have a type from its context.
+            let is_typed = !is_annotated && !services.type_flags(ty).contains(TypeFlags::ANY);
+            parameters.push(ParameterType {
+                binding: hir[parameter.pat].pos,
+                text: match is_typed {
+                    true => text_that_names_nothing(services, ty),
+                    false => None,
+                },
+                is_of_default: !is_annotated
+                    && hir.type_assertion_operand(parameter.default).is_some()
+                    && services.type_at_location(default) == ty,
+                takes_undefined: is_annotated
+                    && services.is_related(Relation::Assignable, TypeId::UNDEFINED, ty),
+            });
+        }
         let mut functions_returning_undefined = Vec::new();
         for (index, function) in hir
             .fns
@@ -4462,6 +4943,7 @@ pub fn module_types(checker: &mut Checker<'_, '_>, file: FileId) -> Option<Modul
             enum_objects,
             exports,
             constants,
+            parameters,
             functions_returning_undefined,
             globals,
             augmented_modules,
@@ -4532,6 +5014,8 @@ pub struct TypedFiles {
     pub typed: Vec<(Vec<u8>, Vec<u8>)>,
     pub declarations_while_checked: Vec<(Vec<u8>, Vec<u8>)>,
     pub dropped_casts: usize,
+    /// The output has a default value in a function body that [`TypesOfDefaults`] is about.
+    pub moved_defaults: bool,
 }
 
 fn inside<'a>(directory: &[u8], path: &'a [u8]) -> Option<&'a [u8]> {
@@ -4589,6 +5073,7 @@ fn typed_outputs(
     outputs: &[Output<'_>],
     modules: &[ModuleTypes],
     emitted_declarations: &[ModuleTypes],
+    types_of_defaults: TypesOfDefaults,
 ) -> Result<Vec<(Vec<u8>, TypedText)>, TypedFilesError> {
     let outdir = outdir.strip_suffix(b"/").unwrap_or(outdir);
     let mut found = Vec::new();
@@ -4598,6 +5083,7 @@ fn typed_outputs(
             modules,
             emitted_declarations,
             entry_point: output.entry_point,
+            types_of_defaults,
         };
         let typed =
             add_types_by_source_map(output.path, output.javascript, output.source_map, &bundle)
@@ -4697,6 +5183,7 @@ pub fn build_typed_files(
     outputs: &[Output<'_>],
     modules: &[ModuleTypes],
     emitted_declarations: &[ModuleTypes],
+    types_of_defaults: TypesOfDefaults,
 ) -> Result<TypedFiles, TypedFilesError> {
     let outdir = outdir.strip_suffix(b"/").unwrap_or(outdir);
     let mut found = TypedFiles {
@@ -4704,18 +5191,21 @@ pub fn build_typed_files(
         typed: Vec::new(),
         declarations_while_checked: Vec::new(),
         dropped_casts: 0,
+        moved_defaults: false,
     };
     for (output, (typed_path, typed)) in outputs.iter().zip(typed_outputs(
         outdir,
         outputs,
         modules,
         emitted_declarations,
+        types_of_defaults,
     )?) {
         let name_of = |path: &[u8]| {
             path[bun_core::strings::last_index_of_char(path, b'/').map_or(0, |slash| slash + 1)..]
                 .to_vec()
         };
         found.dropped_casts += typed.dropped_casts;
+        found.moved_defaults |= typed.moved_defaults;
         found
             .modules_of_untyped_values
             .extend(typed.modules_of_untyped_values);
