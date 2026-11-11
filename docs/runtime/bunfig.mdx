@@ -68,8 +68,10 @@ smol = true
 Set the log level: `"debug"`, `"warn"`, or `"error"`.
 
 ```toml title="bunfig.toml" icon="settings"
-logLevel = "debug" # "debug" | "warn" | "error"
+logLevel = "warn" # "debug" | "warn" | "error"
 ```
+
+The package manager (`bun install`, `bun add` and so on), `bun lint` and `bun fmt` do not read `logLevel`. Use their flags: `--silent`, `--quiet` and `--verbose` for the package manager, `--quiet` and `--silent` for `bun lint`, and `--log-level` for `bun fmt`.
 
 ### `define`
 
@@ -1216,12 +1218,7 @@ hoist = false
 
 ### `install.logLevel`
 
-Set the log level for `bun install`. This can be one of `"debug"`, `"warn"`, or `"error"`.
-
-```toml title="bunfig.toml" icon="settings"
-[install]
-logLevel = "warn"
-```
+`bun install` does not read this key. Use `--silent`, `--quiet` or `--verbose`.
 
 ### `install.security.scanner`
 

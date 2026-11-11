@@ -1,4 +1,4 @@
-import { describe } from "bun:test";
+import { describe, expect } from "bun:test";
 import { itBundled } from "./expectBundled";
 
 // Not describe.concurrent: the backend:"cli" cases each spawn a full
@@ -148,6 +148,48 @@ console.log("PRELOAD");
     },
     run: {
       stdout: "PRELOAD\nENTRY",
+      setCwd: true,
+    },
+  });
+
+  // Test that logLevel in bunfig.toml applies: at "debug" bun prints how long it took to read .env
+  itBundled("compile/AutoloadBunfigLogLevel", {
+    compile: true,
+    files: {
+      "/entry.ts": /* js */ `
+        console.log(process.env.TEST_VAR || "not found");
+      `,
+    },
+    runtimeFiles: {
+      "/bunfig.toml": `logLevel = "debug"`,
+      "/.env": `TEST_VAR=from_dotenv`,
+    },
+    run: {
+      stdout: "from_dotenv",
+      setCwd: true,
+      validate({ stderr }) {
+        expect(stderr).toContain(`] ".env"\n`);
+      },
+    },
+  });
+
+  // Test that logLevel in bunfig.toml does not apply with autoloadBunfig: false
+  itBundled("compile/AutoloadBunfigDisabledLogLevel", {
+    compile: {
+      autoloadBunfig: false,
+    },
+    files: {
+      "/entry.ts": /* js */ `
+        console.log(process.env.TEST_VAR || "not found");
+      `,
+    },
+    runtimeFiles: {
+      "/bunfig.toml": `logLevel = "debug"`,
+      "/.env": `TEST_VAR=from_dotenv`,
+    },
+    run: {
+      stdout: "from_dotenv",
+      stderr: "",
       setCwd: true,
     },
   });
