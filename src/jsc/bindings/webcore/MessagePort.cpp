@@ -428,13 +428,13 @@ bool MessagePort::virtualHasPendingActivity() const
     if (!scriptExecutionContext() || m_isDetached)
         return false;
     uint64_t s = m_pipe->state(m_side);
-    // A 'close' listener must outlive a GC until the event lands: the pipe's drain
+    // A 'close' listener must outlive a GC until the event lands: the pipe's task
     // holds only a weak ref back here. This does pin both ends of an idle channel until
     // the context dies; node retains more — it never collects an entangled port at all.
     // Not while the close waits behind messages that nothing here reads: only script
     // that still holds this wrapper can read them.
     if (m_hasCloseEventListener.load(std::memory_order_acquire) && !m_closeEventDispatched
-        && (m_hasMessageEventListener || !(s & MessagePortPipe::PeerClosed) || (s & MessagePortPipe::DrainScheduled)))
+        && (m_hasMessageEventListener || !(s & MessagePortPipe::PeerClosed) || MessagePortPipe::taskScheduled(s)))
         return true;
     // The port's own listeners only: a parentPort delivering to `self.onmessage` (the global-scope
     // count hasMessageEventListener() adds) is rooted by the worker global for the worker's life, and
@@ -442,14 +442,14 @@ bool MessagePort::virtualHasPendingActivity() const
     if (!m_hasMessageEventListener)
         return false;
 
-    // Keep alive while a drain task is pending or mid-dispatch. drainAndDispatch
+    // Keep alive while a task is pending or mid-dispatch. drainAndDispatch
     // pops each message (queued -> 0) before invoking listeners, so the in-hand
-    // message is invisible to the queued count; without this bit a concurrent GC
+    // message is invisible to the queued count; without these bits a concurrent GC
     // running inside that window (queue empty, peer already closed) severs the
     // wrapper weak and the dispatch hits a dead JSEventListener wrapper (debug
     // ASSERT m_wrapper). DrainScheduled is set from schedule until the inbox is
-    // observed empty and the peer's close was handed over, covering every dispatch.
-    if (s & MessagePortPipe::DrainScheduled)
+    // observed empty, and CloseScheduled until the peer's close was handed over.
+    if (MessagePortPipe::taskScheduled(s))
         return true;
 
     // Keep alive if the peer is still open and could send more, or messages are
@@ -593,6 +593,11 @@ void MessagePort::jsRef(JSGlobalObject* lexicalGlobalObject)
         m_hasRef = true;
         ref();
         Bun__eventLoop__refKeepAlive(WebCore::clientData(lexicalGlobalObject->vm())->bunVM, 1);
+        // The peer's close releases this ref, so it has to reach a port with no listener too.
+        if (!(s & (MessagePortPipe::Attached | MessagePortPipe::ContextKnown))) {
+            if (auto* context = scriptExecutionContext())
+                m_pipe->registerCloseContext(m_side, *context, ThreadSafeWeakPtr<MessagePort> { *this });
+        }
     }
 }
 

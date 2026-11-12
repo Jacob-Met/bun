@@ -73,10 +73,10 @@ public:
     // The worker's entry module finished evaluating: a start() requested before that takes effect now.
     void entrySettled();
     void close();
-    // Called by the pipe's drain once the peer closed and everything it sent was
+    // Called by the pipe's close task once the peer closed and everything it sent was
     // consumed: dispatches a 'close' event and releases the event-loop ref so the loop can idle.
     void peerClosed();
-    // Called by the pipe's drain when the peer closed and this port does not read the
+    // Called by the pipe's close task when the peer closed and this port does not read the
     // messages queued ahead of that close.
     void peerCloseHeld();
     void dispatchCloseEvent();

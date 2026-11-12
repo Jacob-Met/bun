@@ -352,7 +352,7 @@ test("a pending close event survives GC after the port becomes unreachable", asy
   expect(fired).toBe(50);
 });
 
-// The pipe's drain task only holds a weak ref back to this port, so a
+// The pipe's close task only holds a weak ref back to this port, so a
 // port whose only listener is 'close' must survive GC until the event is delivered.
 test("a close event from the peer survives GC of the unreachable port", async () => {
   let fired = 0;
@@ -477,7 +477,7 @@ test("a port transferred after it was told of its peer's close tells its next ow
   carrier.port1.close();
 });
 
-// The drain task that hands over the peer's close is what keeps a close-only port alive
+// The task that hands over the peer's close is what keeps a close-only port alive
 // between that close and its event.
 test("a close event from the peer survives a GC that runs before it is delivered", async () => {
   let closes = 0;
