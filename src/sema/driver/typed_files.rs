@@ -1298,6 +1298,12 @@ impl Mappings {
         Ok(Mappings { entries })
     }
 
+    /// Not every token has an entry of its own: the first of `export default <value>` has none.
+    fn source_before(&self, generated: u32) -> Option<u32> {
+        let until = self.entries.partition_point(|entry| entry.0 <= generated);
+        self.entries[..until].last().map(|entry| entry.1)
+    }
+
     fn original(&self, generated: u32) -> Option<(u32, u32)> {
         let until = self.entries.partition_point(|entry| entry.0 <= generated);
         let last = self.entries[..until]
@@ -1542,6 +1548,22 @@ enum Piece {
     Source(u32, u32),
 }
 
+impl Written<'_, '_> {
+    fn ambient_variables(&self, named: &[(u32, Vec<u8>)]) -> Option<Vec<u8>> {
+        let mut text = Vec::new();
+        for (binding, name) in named {
+            for piece in self.syntax.ambient_variable(*binding, name, self.types)? {
+                match piece {
+                    Piece::Text(written) => text.extend_from_slice(&written),
+                    Piece::Source(start, end) => text.extend_from_slice(&self.text(start, end)),
+                }
+            }
+        }
+        text.pop();
+        Some(text)
+    }
+}
+
 #[derive(Default)]
 struct Declared {
     bindings: Vec<u32>,
@@ -1553,6 +1575,13 @@ struct Declared {
     is_ambient_value: bool,
     is_function: bool,
     is_default_expression: bool,
+}
+
+impl Declared {
+    /// An import is a binding that is not one of `names`.
+    fn has_no_binding_of_its_own(&self) -> bool {
+        self.bindings.iter().all(|at| !self.names.contains(at))
+    }
 }
 
 impl<'a, 's> Syntax<'a, 's> {
@@ -1920,6 +1949,56 @@ impl<'a, 's> Syntax<'a, 's> {
         }
         declared
     }
+
+    /// The namespaces among the statements of a name that make no JavaScript.
+    fn erased_namespaces(&self, found: &Declared) -> impl Iterator<Item = ModuleId> {
+        let file = self.file;
+        (found.statements.iter()).filter_map(move |&statement| match file[statement].kind {
+            StmtKind::Module(module) => Some(module),
+            _ => None,
+        })
+    }
+
+    fn is_erased_value(&self, found: &Declared) -> bool {
+        use bun_sema::bind::{ModuleInstanceState, module_instance_state};
+        found.is_ambient_value
+            || self.erased_namespaces(found).any(|module| {
+                module_instance_state(self.file, self.text, module)
+                    != ModuleInstanceState::NonInstantiated
+            })
+    }
+
+    /// `declare const { a, b }: T` is one statement for every name in it.
+    fn is_in_erased_pattern(&self, found: &Declared) -> bool {
+        let file = self.file;
+        let is_pattern =
+            |declaration: VarDeclId| !matches!(file[file[declaration].pat].kind, PatKind::Ident(_));
+        found.statements.iter().any(|&statement| {
+            matches!(file[statement].kind, StmtKind::Var(all) if all.iter().any(is_pattern))
+        })
+    }
+
+    /// The identifiers that no scope around them binds, each with the source that prints it.
+    fn free_reads(&self, mappings: &Mappings) -> FxHashSet<(Option<u32>, &'a [u8])> {
+        let file = self.file;
+        let top_level: FxHashSet<u32> = self.top_level_value_names().into_iter().collect();
+        let bound: FxHashSet<&[u8]> = (top_level.iter().copied())
+            .chain(self.imported_names())
+            .map(|at| self.word(at))
+            .collect();
+        let statements: Vec<u32> = file.ids(file.body).map(|id| file[id].start).collect();
+        let statement_of = |at: u32| statements.partition_point(|&start| start <= at);
+        let nested: FxHashSet<(usize, &[u8])> = (self.value_names())
+            .filter(|at| !top_level.contains(at))
+            .map(|at| (statement_of(at), self.word(at)))
+            .collect();
+        let free = self.used_names().filter_map(|at| {
+            let name = self.word(at);
+            let is_bound = bound.contains(name) || nested.contains(&(statement_of(at), name));
+            (!is_bound).then(|| (mappings.source_before(at), name))
+        });
+        free.collect()
+    }
 }
 
 struct NamespaceObject<'a> {
@@ -1943,6 +2022,9 @@ struct Linked {
     ambient_enums: FxHashSet<(usize, u32)>,
     ambient_signatures: FxHashSet<(usize, u32)>,
     replaced_statements: FxHashSet<(usize, u32)>,
+    /// What `is_pinned` in `link` holds for, by module: the position of a name, and a statement.
+    pinned_names: FxHashSet<(usize, u32)>,
+    pinned_statements: FxHashSet<(usize, u32)>,
     modules_of_untyped_values: Vec<Vec<u8>>,
     emitted_enums: FxHashMap<(u32, u32), Vec<u8>>,
     enum_names: FxHashMap<(u32, u32), Vec<u8>>,
@@ -2167,6 +2249,19 @@ fn link(
         .into_iter()
         .map(|at| output.word(at))
         .collect();
+    let (free_reads, free_names) = (std::cell::OnceCell::new(), std::cell::OnceCell::new());
+    let is_read_by = |index: usize, name: &[u8], is_script: bool| {
+        let reads = free_reads.get_or_init(|| output.free_reads(mappings));
+        match is_script {
+            true => free_names
+                .get_or_init(|| reads.iter().map(|read| read.1).collect::<FxHashSet<_>>())
+                .contains(name),
+            false => [Some(index as u32), None]
+                .iter()
+                .any(|&reader| reads.contains(&(reader, name))),
+        }
+    };
+    let mut pinned_anywhere: FxHashSet<&[u8]> = FxHashSet::default();
     let mut names: Vec<FxHashMap<&[u8], Vec<u8>>> = vec![FxHashMap::default(); written.len()];
     let mut values: Vec<FxHashMap<&[u8], &[u8]>> = vec![FxHashMap::default(); written.len()];
     let mut imports: FxHashMap<Vec<u8>, Vec<u8>> = FxHashMap::default();
@@ -2294,6 +2389,30 @@ fn link(
             {
                 continue;
             }
+            let syntax = &module.syntax;
+            let is_script =
+                (module.types).map_or(!syntax.file.has_module_syntax, |types| types.is_script);
+            let may_be_value =
+                found.is_ambient_value || syntax.erased_namespaces(found).next().is_some();
+            // A read in the JavaScript cannot follow a new name.
+            let is_pinned = may_be_value
+                && found.has_no_binding_of_its_own()
+                && !emitted_from.contains_key(&index)
+                && taken.contains(name)
+                && syntax.is_erased_value(found)
+                && is_read_by(index, name, is_script || syntax.is_in_erased_pattern(found));
+            if is_pinned {
+                pinned_anywhere.insert(name);
+                let (names, statements) = (found.names.iter(), found.statements.iter());
+                linked.pinned_names.extend(names.map(|&at| (index, at)));
+                linked
+                    .pinned_statements
+                    .extend(statements.map(|statement| (index, statement.0)));
+            }
+            let name_to_write = |taken: &mut FxHashSet<Vec<u8>>| match is_pinned {
+                true => name.to_vec(),
+                false => unique(name, taken),
+            };
             if let Some((statement, imported_as)) = found.import {
                 let (file, statement) = (module.syntax.file, &module.syntax.file[statement]);
                 let StmtKind::Import(import) = statement.kind else {
@@ -2307,7 +2426,7 @@ fn link(
                     continue;
                 }
                 if is_relative {
-                    names[index].insert(name, unique(name, &mut taken));
+                    names[index].insert(name, name_to_write(&mut taken));
                     continue;
                 }
                 let imported = match imported_as {
@@ -2318,11 +2437,14 @@ fn link(
                     }
                 };
                 let key = [imported, b" ", tail].concat();
-                if let Some(known) = imports.get(&key) {
+                if let Some(known) = imports
+                    .get(&key)
+                    .filter(|known| !is_pinned || &known[..] == name)
+                {
                     names[index].insert(name, known.clone());
                     continue;
                 }
-                let local = unique(name, &mut taken);
+                let local = name_to_write(&mut taken);
                 let clause = match imported_as {
                     ImportedAs::Default => local.clone(),
                     ImportedAs::Namespace => [&b"* as "[..], &local[..]].concat(),
@@ -2349,12 +2471,7 @@ fn link(
                 names[index].insert(name, local);
                 continue;
             }
-            if found.is_ambient_value
-                && found.bindings.is_empty()
-                && !emitted_from.contains_key(&index)
-                && !declared_in_output.contains(name)
-            {
-                taken.insert(name.to_vec());
+            if is_pinned {
                 names[index].insert(name, name.to_vec());
                 continue;
             }
@@ -2448,9 +2565,10 @@ fn link(
         let is_only_a_type = |target: &Target| {
             place_of(target)
                 .and_then(|(index, name)| {
+                    let syntax = &written[index].as_ref()?.syntax;
                     declared[index]
                         .get(&name[..])
-                        .map(|found| found.bindings.is_empty() && !found.is_ambient_value)
+                        .map(|found| found.bindings.is_empty() && !syntax.is_erased_value(found))
                 })
                 .unwrap_or(false)
         };
@@ -2642,7 +2760,10 @@ fn link(
                 types
                     .globals
                     .iter()
-                    .filter(|&&at| declared_in_output.contains(syntax.word(at)))
+                    .filter(|&&at| {
+                        let word = syntax.word(at);
+                        declared_in_output.contains(word) || pinned_anywhere.contains(word)
+                    })
                     .map(|&at| (at, at, b"globalThis.".to_vec())),
             );
             for &at in &types.enum_objects {
@@ -3576,9 +3697,8 @@ impl<'a> Transfer<'_, 'a, '_> {
             self.linked,
         );
         let (output_file, insertions) = (output.file, &mut self.insertions);
-        let mut ambient_values: FxHashSet<&[u8]> = FxHashSet::default();
-        let output_identifiers: FxHashSet<&[u8]> =
-            output.used_names().map(|at| output.word(at)).collect();
+        let mut written_names: FxHashSet<Vec<u8>> = FxHashSet::default();
+        let mut written_texts: FxHashSet<Vec<u8>> = FxHashSet::default();
         let mut output_statements: FxHashMap<(u32, u32), u32> = FxHashMap::default();
         for (id, statement) in output_file.stmts.iter().enumerate() {
             for key in [statement.start, output.after_modifiers(StmtId(id as u32))] {
@@ -3644,20 +3764,27 @@ impl<'a> Transfer<'_, 'a, '_> {
                             declarations.iter().for_each(|declaration: VarDeclId| {
                                 syntax.identifiers(file[declaration].pat, &mut names)
                             });
-                            let is_referenced = |name: &[u8]| {
-                                output_identifiers.contains(name)
+                            let mut new_names = Vec::new();
+                            for &at in &names {
+                                let is_referenced = linked.pinned_names.contains(&(index, at))
                                     || module.types.is_none_or(|types| {
-                                        self.type_references.contains(&(&types.path[..], name))
-                                    })
-                            };
-                            let mut is_new = false;
-                            for name in names.iter().map(|&name| syntax.word(name)) {
-                                is_new |= is_referenced(name) && ambient_values.insert(name);
+                                        let name = (&types.path[..], syntax.word(at));
+                                        self.type_references.contains(&name)
+                                    });
+                                let written = module.text(at, syntax.token_end(at));
+                                if is_referenced && written_names.insert(written.clone()) {
+                                    new_names.push((at, written));
+                                }
                             }
-                            if !is_new {
+                            if new_names.is_empty() {
                                 continue;
                             }
-                            module.statement_text(id, Flags::EXPORT | Flags::DEFAULT)
+                            let declarators = (new_names.len() < names.len())
+                                .then(|| module.ambient_variables(&new_names))
+                                .flatten();
+                            declarators.unwrap_or_else(|| {
+                                module.statement_text(id, Flags::EXPORT | Flags::DEFAULT)
+                            })
                         }
                         StmtKind::Fn(_) if linked.ambient_signatures.contains(&(index, id.0)) => {
                             continue;
@@ -3679,7 +3806,13 @@ impl<'a> Transfer<'_, 'a, '_> {
                             }
                         }
                         _ if syntax.is_type_only_statement(id) => {
-                            module.statement_text(id, Flags::EXPORT | Flags::DEFAULT)
+                            let text = module.statement_text(id, Flags::EXPORT | Flags::DEFAULT);
+                            let is_written_once = linked.pinned_statements.contains(&(index, id.0))
+                                || depth == 0 && module.types.is_none();
+                            if is_written_once && !written_texts.insert(text.clone()) {
+                                continue;
+                            }
+                            text
                         }
                         _ => continue,
                     };
@@ -4124,6 +4257,7 @@ pub struct ModuleTypes {
     pub augmented_modules: Vec<(u32, Box<[u8]>)>,
     pub locals: Vec<(u32, u32)>,
     pub emitted_declarations: Box<[u8]>,
+    pub is_script: bool,
 }
 
 impl ModuleTypes {
@@ -4457,6 +4591,7 @@ pub fn module_types(checker: &mut Checker<'_, '_>, file: FileId) -> Option<Modul
             augmented_modules,
             locals,
             emitted_declarations: Box::default(),
+            is_script: !hir.has_module_syntax || hir.is_script_for_project,
         }
     }))
 }
