@@ -49,7 +49,14 @@ describe.concurrent("bunfig.toml logLevel", () => {
     await using proc = Bun.spawn({
       cmd: [bunExe(), ...cmd],
       argv0: name.startsWith("node ") ? "node" : undefined,
-      env: { ...bunEnv, HOME: String(dir), XDG_CONFIG_HOME: undefined, BUNFIG_LOG_LEVEL_UNSET: undefined, ...env },
+      env: {
+        ...bunEnv,
+        HOME: String(dir),
+        XDG_CONFIG_HOME: undefined,
+        BUNFIG_LOG_LEVEL_UNSET: undefined,
+        BUN_CONFIG_VERBOSE_FETCH: undefined,
+        ...env,
+      },
       cwd: String(dir),
       stdout: "pipe",
       stderr: "pipe",
