@@ -21,6 +21,10 @@
 #include <JavaScriptCore/GetterSetter.h>
 #include <JavaScriptCore/WeakMapImpl.h>
 #include <JavaScriptCore/WeakMapImplInlines.h>
+#include <JavaScriptCore/JSWeakMap.h>
+#include <JavaScriptCore/JSWeakMapInlines.h>
+#include <JavaScriptCore/ArrayStorage.h>
+#include <JavaScriptCore/SparseArrayValueMap.h>
 #include <JavaScriptCore/FunctionPrototype.h>
 #include <JavaScriptCore/DateInstance.h>
 #include <JavaScriptCore/JSModuleEnvironment.h>
@@ -49,6 +53,12 @@ BUN_DECLARE_HOST_FUNCTION(JSMock__jsResetAllMocks);
 BUN_DECLARE_HOST_FUNCTION(JSMock__jsSpyOn);
 BUN_DECLARE_HOST_FUNCTION(JSMock__jsMockFn);
 extern "C" bool JSMock__isInPreload(Zig::GlobalObject*);
+
+// A preload runs, or a beforeAll() of one. What it makes stays for every test file.
+static bool isPreloadRunning(Zig::GlobalObject* globalObject)
+{
+    return globalObject->mockModule.preloadMayBeRunning && JSMock__isInPreload(globalObject);
+}
 
 #define CHECK_IS_MOCK_FUNCTION(thisValue)                                \
     if (!thisObject) [[unlikely]] {                                      \
@@ -297,7 +307,7 @@ static bool isModuleNamespace(JSObject* object)
     return object->inherits<JSModuleNamespaceObject>();
 }
 
-static bool isOpaqueProperty(JSGlobalObject* globalObject, JSObject* object, PropertyName key)
+static ALWAYS_INLINE bool isOpaqueProperty(JSGlobalObject* globalObject, JSObject* object, PropertyName key)
 {
     if (!object->structure()->typeInfo().prohibitsPropertyCaching()) [[likely]]
         return false;
@@ -450,6 +460,24 @@ public:
     bool hasLazyPrototype { true };
     // Preloads and their beforeAll() hooks run once for all test files, so the end of a test file leaves it alone.
     bool isMadeByPreload { false };
+    // An automock with AutomockLifetime::EveryTestFile, or one of a test file that such an automock found in place and kept, or that a spyOn() of a preload returned.
+    // It stays where it is when a test file ends.
+    bool standsForEveryTestFile { false };
+
+    // The function that a `{ spy: true }` automock of a test file spies on with this mock.
+    JSValue spiedByAutomockOfTestFile() const
+    {
+        return isAutomock && !standsForEveryTestFile ? m_initialImplementation.get() : JSValue();
+    }
+
+    // spyOn() found this mock in the property and returned it. If a preload did so, the mock is the preload's from here on.
+    void didSpyOnAgain(Zig::GlobalObject* globalObject)
+    {
+        if (!isAutomock || standsForEveryTestFile || !isPreloadRunning(globalObject)) [[likely]]
+            return;
+        standsForEveryTestFile = true;
+        isMadeByPreload = true;
+    }
 
     static constexpr unsigned SpyAttributeESModuleNamespace = 1 << 30;
     // The spy is the property's getter or setter, or what its getter returns.
@@ -1213,6 +1241,22 @@ void JSMockFunction::resetAll(Zig::GlobalObject* globalObject)
     forEachIn(globalObject, List::Configured, [globalObject](JSMockFunction* mock) { mock->resetConfiguration(globalObject); });
 }
 
+// For a loop that keeps going after an exception and throws the first one at the end. Takes the exception out of `scope`.
+// False if it is one that stays, so the loop has to stop.
+static bool keepFirstException(JSC::ThrowScope& scope, JSC::Exception*& firstException)
+{
+    auto* exception = scope.exception();
+    if (!exception) [[likely]]
+        return true;
+    if (!scope.tryClearException())
+        return false;
+    if (!firstException)
+        firstException = exception;
+    return true;
+}
+
+static void undoAutomockWrites(Zig::GlobalObject*);
+
 // The next test file shares the global object, so this file's spies and recorded calls have to go.
 // Configured mocks stay registered, because a module shared with the next file may own them.
 __attribute__((minsize)) void JSMockFunction::didFinishTestFile(Zig::GlobalObject* globalObject)
@@ -1221,8 +1265,8 @@ __attribute__((minsize)) void JSMockFunction::didFinishTestFile(Zig::GlobalObjec
     auto scope = DECLARE_THROW_SCOPE(vm);
     MarkedArgumentBuffer spiesOfPreload;
     JSC::Exception* firstException = nullptr;
-    // Loop, because a Proxy trap hit while restoring one spy may install another.
-    while (globalObject->mockModule.activeSpies) {
+    // Loop, because a Proxy trap hit while restoring one spy may install another, and so may one hit while a write is undone.
+    while (globalObject->mockModule.activeSpies || globalObject->mockModule.automockWrites) {
         forEachIn(globalObject, List::Spies, [&](JSMockFunction* spy) {
             if (spy->isMadeByPreload) {
                 spiesOfPreload.append(spy);
@@ -1234,12 +1278,18 @@ __attribute__((minsize)) void JSMockFunction::didFinishTestFile(Zig::GlobalObjec
             if (scope.exception()) [[unlikely]]
                 spy->didUninstall();
         });
-        if (auto* exception = scope.exception()) [[unlikely]] {
-            if (!scope.tryClearException())
-                return;
-            if (!firstException)
-                firstException = exception;
-        }
+        if (!keepFirstException(scope, firstException))
+            return;
+        if (!globalObject->mockModule.automockWrites)
+            continue;
+        // What the file's `{ spy: true }` automocks stored in place goes once the spies are restored: a spy that the file laid over an automock's spy has put that spy back.
+        undoAutomockWrites(globalObject);
+        if (!keepFirstException(scope, firstException))
+            return;
+        // A setter or a Proxy trap that took a value back may have queued a job. It runs now, while what the file stubbed is still in place.
+        globalObject->drainMicrotasks();
+        if (!keepFirstException(scope, firstException))
+            return;
     }
     for (size_t i = 0; i < spiesOfPreload.size(); ++i) {
         auto* spy = uncheckedDowncast<JSMockFunction>(spiesOfPreload.at(i));
@@ -1433,6 +1483,7 @@ template<typename Visitor> void JSMockModule::visit(Visitor& visitor)
     visitor.append(envsOfPreload);
     visitor.append(globalsOfPreload);
     visitor.append(dynamicImports);
+    visitor.append(automockWrites);
 }
 
 template void JSMockModule::visit(JSC::AbstractSlotVisitor&);
@@ -1667,6 +1718,121 @@ static ALWAYS_INLINE JSC::JSValue runMockImplementation(JSC::JSGlobalObject* glo
     RELEASE_AND_RETURN(scope, JSC::call(globalObject, function, callData, thisValue, args));
 }
 
+// How a `{ spy: true }` automock of a test file stored a replacement in place.
+enum class AutomockWrite : uint8_t {
+    // The object had the property. Its value goes back.
+    Replaced,
+    // The object inherited the property and now has one of its own, which goes.
+    Added,
+    // A setter took the replacement, so it takes the value back.
+    Assigned,
+};
+
+// JSMockModule::automockWrites, for undoAutomockWrites(). A JSArray with:
+// - a JSWeakMap from an object to its writes: for each property that an automock of the test file stored in, an AutomockWrite.
+//   Where it stored the copy of an array or of a module namespace object, [original, copy, AutomockWrite]: a spy knows what it spies on, a copy doesn't.
+// - a JSWeakMap with each such copy, and with each other copy of an array that is no element of a copy. For the copy of an array it has an ElementsRecord.
+// - behind them, the Proxy objects that have writes. A Proxy does not hold what is stored through it, so its writes may not go when nothing else holds the Proxy.
+enum AutomockJournal : unsigned {
+    WritesOfObjects,
+    CopiesToSpy,
+};
+
+static JSC::JSArray* automockJournalIfAny(Zig::GlobalObject* globalObject)
+{
+    JSValue journal = globalObject->mockModule.automockWrites.get();
+    return journal ? uncheckedDowncast<JSC::JSArray>(journal) : nullptr;
+}
+
+static JSC::JSWeakMap* mapOf(JSC::JSArray* journal, AutomockJournal which)
+{
+    return uncheckedDowncast<JSC::JSWeakMap>(journal->getIndexQuickly(which));
+}
+
+static JSC::JSArray* ensureAutomockJournal(Zig::GlobalObject* globalObject)
+{
+    auto& vm = JSC::getVM(globalObject);
+    auto scope = DECLARE_THROW_SCOPE(vm);
+
+    if (auto* journal = automockJournalIfAny(globalObject))
+        return journal;
+    MarkedArgumentBuffer maps;
+    maps.append(JSC::JSWeakMap::create(vm, globalObject->weakMapStructure()));
+    maps.append(JSC::JSWeakMap::create(vm, globalObject->weakMapStructure()));
+    auto* journal = JSC::constructArray(globalObject, static_cast<JSC::ArrayAllocationProfile*>(nullptr), maps);
+    RETURN_IF_EXCEPTION(scope, nullptr);
+    globalObject->mockModule.automockWrites.set(vm, globalObject, journal);
+    return journal;
+}
+
+// The function that `value` spies on for a `{ spy: true }` automock of a test file.
+// Empty unless `value` is such a spy, or the mock that an instance has of one on the prototype of its class.
+static JSValue spiedByAutomockOfTestFile(JSValue value)
+{
+    // Most values are looked at for nothing, and the type says so at once.
+    if (!value || !value.isCell() || value.asCell()->type() != JSC::InternalFunctionType)
+        return {};
+    auto* mock = dynamicDowncast<JSMockFunction>(value.asCell());
+    if (mock && mock->prototypeMock)
+        mock = mock->prototypeMock.get();
+    return mock ? mock->spiedByAutomockOfTestFile() : JSValue();
+}
+
+static bool hasElementsAsMade(Zig::GlobalObject*, JSC::JSArray* copy, JSC::JSWeakMap* copies);
+
+// An automock of the test file has stored in the property, which held `replaced`: the copy of `replaced`, or if `copy` is empty, a spy.
+__attribute__((minsize)) static void didStoreInPlace(Zig::GlobalObject* globalObject, JSObject* object, const Identifier& key, AutomockWrite how, JSValue replaced, JSValue copy = {})
+{
+    auto& vm = JSC::getVM(globalObject);
+    auto scope = DECLARE_THROW_SCOPE(vm);
+
+    auto* journal = ensureAutomockJournal(globalObject);
+    RETURN_IF_EXCEPTION(scope, );
+    auto* writes = mapOf(journal, WritesOfObjects);
+    JSObject* writesByKey = writes->get(object).getObject();
+    if (!writesByKey) {
+        writesByKey = JSC::constructEmptyObject(vm, globalObject->nullPrototypeObjectStructure());
+        writes->set(vm, object, writesByKey);
+        if (object->type() == ProxyObjectType) {
+            journal->push(globalObject, object);
+            RETURN_IF_EXCEPTION(scope, );
+        }
+    }
+
+    // An automock may store where an earlier one did. If it replaces what that one stored, how that one found the property still holds, and so does what its copy was made of.
+    // If not, the test file has put a value of its own there since, and this write is the one to undo. The copy of an array that the file changed is such a value.
+    JSValue known = writesByKey->getIfPropertyExists(globalObject, key);
+    RETURN_IF_EXCEPTION(scope, );
+    auto* ofEarlierCopy = known ? dynamicDowncast<JSC::JSArray>(known) : nullptr;
+    bool replacesEarlierStore = ofEarlierCopy ? ofEarlierCopy->getIndexQuickly(1) == replaced : known && spiedByAutomockOfTestFile(replaced);
+    if (auto* earlierCopy = replacesEarlierStore && ofEarlierCopy ? dynamicDowncast<JSC::JSArray>(replaced) : nullptr) {
+        replacesEarlierStore = hasElementsAsMade(globalObject, earlierCopy, mapOf(journal, CopiesToSpy));
+        RETURN_IF_EXCEPTION(scope, );
+    }
+    JSValue write = jsNumber(static_cast<uint8_t>(how));
+    if (replacesEarlierStore)
+        write = ofEarlierCopy ? ofEarlierCopy->getIndexQuickly(2) : known;
+    if (copy) {
+        MarkedArgumentBuffer ofCopy;
+        ofCopy.append(replacesEarlierStore && ofEarlierCopy ? ofEarlierCopy->getIndexQuickly(0) : replaced);
+        ofCopy.append(copy);
+        ofCopy.append(write);
+        write = JSC::constructArray(globalObject, static_cast<JSC::ArrayAllocationProfile*>(nullptr), ofCopy);
+        RETURN_IF_EXCEPTION(scope, );
+    }
+    scope.release();
+    writesByKey->putDirectMayBeIndex(globalObject, key, write);
+}
+
+// An automock of the test file has made `copy` of a module namespace object, to put spies in it.
+__attribute__((minsize)) static void didCopyToSpy(Zig::GlobalObject* globalObject, JSObject* copy)
+{
+    auto scope = DECLARE_THROW_SCOPE(JSC::getVM(globalObject));
+    auto* journal = ensureAutomockJournal(globalObject);
+    RETURN_IF_EXCEPTION(scope, );
+    mapOf(journal, CopiesToSpy)->set(JSC::getVM(globalObject), copy, jsUndefined());
+}
+
 static void mockInstanceMethods(Zig::GlobalObject* globalObject, JSMockFunction* fn, JSC::JSObject* instance)
 {
     auto& vm = JSC::getVM(globalObject);
@@ -1677,6 +1843,9 @@ static void mockInstanceMethods(Zig::GlobalObject* globalObject, JSMockFunction*
     if (!prototypeValue || !prototypeValue.isObject())
         return;
     JSObject* prototype = asObject(prototypeValue);
+    // A test file's `{ spy: true }` automock spied on the prototype in place. An instance may be one that a module keeps, so its mocks go with the file too.
+    JSC::JSArray* journal = automockJournalIfAny(globalObject);
+    bool goesWithTestFile = journal && mapOf(journal, WritesOfObjects)->has(prototype);
 
     JSC::PropertyNameArrayBuilder keys(vm, JSC::PropertyNameMode::StringsAndSymbols, JSC::PrivateSymbolMode::Exclude);
     prototype->methodTable()->getOwnPropertyNames(prototype, globalObject, keys, JSC::DontEnumPropertiesMode::Include);
@@ -1708,9 +1877,18 @@ static void mockInstanceMethods(Zig::GlobalObject* globalObject, JSMockFunction*
         RETURN_IF_EXCEPTION(scope, );
         mock->prototypeMock.set(vm, mock, prototypeMock);
 
+        bool isOwn = false;
+        if (goesWithTestFile) [[unlikely]] {
+            isOwn = instance->hasOwnProperty(globalObject, key);
+            RETURN_IF_EXCEPTION(scope, );
+        }
         JSC::PutPropertySlot putSlot(instance);
         instance->methodTable()->put(instance, globalObject, key, mock, putSlot);
         RETURN_IF_EXCEPTION(scope, );
+        if (goesWithTestFile) [[unlikely]] {
+            didStoreInPlace(globalObject, instance, key, isOwn ? AutomockWrite::Replaced : AutomockWrite::Added, inherited);
+            RETURN_IF_EXCEPTION(scope, );
+        }
     }
 }
 
@@ -2517,6 +2695,368 @@ JSC_DEFINE_HOST_FUNCTION(jsAutomockedAccessor, (JSC::JSGlobalObject*, JSC::CallF
     return JSValue::encode(jsUndefined());
 }
 
+// putOwnPropertyStorage() for the value of a data property. putDirectIndex() leaves an element that is read-only as it is, so such an element is stored where it lies.
+static void putOwnValue(JSGlobalObject* globalObject, JSObject* object, const Identifier& key, JSValue value, unsigned attributes, bool isOpaque)
+{
+    auto index = parseIndex(key);
+    if (index && !isOpaque && (attributes & PropertyAttribute::ReadOnly) && JSC::hasAnyArrayStorage(object->indexingType())) {
+        if (auto* elements = object->butterfly()->arrayStorage()->m_sparseMap.get()) {
+            if (auto element = elements->find(*index); element != elements->notFound()) {
+                JSC::SparseArrayValueMap::entryFor(element).forceSet(JSC::getVM(globalObject), elements, value, attributes);
+                return;
+            }
+        }
+    }
+    putOwnPropertyStorage(globalObject, object, key, value, attributes, isOpaque);
+}
+
+// The elements that `array` has now, in an array of its own.
+__attribute__((minsize)) static JSC::JSArray* elementsOf(JSGlobalObject* globalObject, JSC::JSArray* array)
+{
+    auto scope = DECLARE_THROW_SCOPE(JSC::getVM(globalObject));
+
+    unsigned length = array->length();
+    auto* elements = JSC::JSArray::fastSlice(globalObject, array, 0, length);
+    RETURN_IF_EXCEPTION(scope, nullptr);
+    if (elements)
+        return elements;
+    // The array is long, or has few of its elements.
+    elements = JSC::constructEmptyArray(globalObject, nullptr);
+    RETURN_IF_EXCEPTION(scope, nullptr);
+    forEachElement(globalObject, array, length, [&](unsigned i) {
+        JSValue element = array->getDirectIndex(globalObject, i);
+        if (scope.exception() || !element)
+            return;
+        elements->putDirectIndex(globalObject, i, element);
+    });
+    RETURN_IF_EXCEPTION(scope, nullptr);
+    scope.release();
+    elements->setLength(globalObject, length, true);
+    return elements;
+}
+
+// What hasElementsAsMade() goes by, for the copy that an automock made of an array. A JSArray with:
+// - the elements that the automock gave the copy, in an array of their own.
+// - the ElementsRecord of each of those elements that is an array, in the order of the elements. Undefined if none is.
+enum ElementsRecord : unsigned {
+    ElementsAsMade,
+    RecordsOfArrays,
+};
+
+static JSValue elementAt(JSGlobalObject* globalObject, JSC::JSArray* array, unsigned i)
+{
+    return array->canGetIndexQuickly(i) ? array->getIndexQuickly(i) : array->getDirectIndex(globalObject, i);
+}
+
+// Calls `apply(array, elementsAsMade)` for `copy`, which has `record`, and for each array that the records have among the elements. Returns false once `apply` does.
+// `seen` has the arrays that need no further call.
+template<typename Functor>
+static bool forEachCopyUnder(JSGlobalObject* globalObject, JSC::JSArray* copy, JSC::JSArray* record, UncheckedKeyHashSet<JSCell*>& seen, const Functor& apply)
+{
+    auto scope = DECLARE_THROW_SCOPE(JSC::getVM(globalObject));
+
+    if (!seen.add(copy).isNewEntry)
+        return true;
+    // Pairs of an array and its record.
+    MarkedArgumentBuffer work;
+    work.append(copy);
+    work.append(record);
+    for (size_t next = 0; next < work.size(); next += 2) {
+        auto* recordOfArray = uncheckedDowncast<JSC::JSArray>(work.at(next + 1));
+        auto* asMade = uncheckedDowncast<JSC::JSArray>(recordOfArray->getIndexQuickly(ElementsAsMade));
+        bool goesOn = apply(uncheckedDowncast<JSC::JSArray>(work.at(next)), asMade);
+        RETURN_IF_EXCEPTION(scope, false);
+        if (!goesOn)
+            return false;
+        auto* records = dynamicDowncast<JSC::JSArray>(recordOfArray->getIndexQuickly(RecordsOfArrays));
+        if (!records)
+            continue;
+        unsigned ofElement = 0;
+        forEachElement(globalObject, asMade, asMade->length(), [&](unsigned i) {
+            JSValue element = elementAt(globalObject, asMade, i);
+            if (scope.exception() || !element || !JSC::isJSArray(element) || ofElement == records->length())
+                return;
+            JSValue recordOfElement = records->getIndexQuickly(ofElement++);
+            if (!seen.add(element.asCell()).isNewEntry)
+                return;
+            work.append(element);
+            work.append(recordOfElement);
+        });
+        RETURN_IF_EXCEPTION(scope, false);
+        if (work.hasOverflowed()) [[unlikely]] {
+            throwOutOfMemoryError(globalObject, scope);
+            return false;
+        }
+    }
+    return true;
+}
+
+// Whether `array` has the elements of `asMade`, each in its place.
+__attribute__((minsize)) static bool hasSameElements(JSGlobalObject* globalObject, JSC::JSArray* array, JSC::JSArray* asMade)
+{
+    auto scope = DECLARE_THROW_SCOPE(JSC::getVM(globalObject));
+
+    unsigned length = asMade->length();
+    if (array->length() != length)
+        return false;
+    bool isSame = true;
+    unsigned elements = 0;
+    forEachElement(globalObject, array, length, [&](unsigned i) {
+        JSValue element = elementAt(globalObject, array, i);
+        if (scope.exception() || !isSame)
+            return;
+        elements += !!element;
+        isSame = element == elementAt(globalObject, asMade, i);
+    });
+    RETURN_IF_EXCEPTION(scope, false);
+    if (!isSame)
+        return false;
+    // With ArrayStorage the length can be huge with few elements, so only the elements that `array` has were visited. The test file may have deleted one.
+    if (JSC::hasAnyArrayStorage(array->indexingType())) {
+        unsigned elementsAsMade = 0;
+        forEachElement(globalObject, asMade, length, [&](unsigned i) {
+            elementsAsMade += !!elementAt(globalObject, asMade, i);
+        });
+        RETURN_IF_EXCEPTION(scope, false);
+        return elementsAsMade == elements;
+    }
+    return true;
+}
+
+// Whether the test file has left `copy` as the automock made it: the copy has the elements that it got, and so has each array among them.
+// `copies` is the CopiesToSpy of the journal. A copy without a record there is one of an automock that threw, which counts as unchanged.
+__attribute__((minsize)) static bool hasElementsAsMade(Zig::GlobalObject* globalObject, JSC::JSArray* copy, JSC::JSWeakMap* copies)
+{
+    auto* record = dynamicDowncast<JSC::JSArray>(copies->get(copy));
+    if (!record)
+        return true;
+    UncheckedKeyHashSet<JSCell*> seen;
+    return forEachCopyUnder(globalObject, copy, record, seen, [&](JSC::JSArray* array, JSC::JSArray* asMade) {
+        return hasSameElements(globalObject, array, asMade);
+    });
+}
+
+static String propertyKeyForMessage(const Identifier& key)
+{
+    return key.isSymbol() ? makeString("Symbol("_s, key.string(), ')') : key.string();
+}
+
+// What the own property `key` of `object` holds, or what a getter gives where a setter takes the value. Empty if the property is no longer there, or is an accessor of the test file.
+static JSValue valueInPlace(Zig::GlobalObject* globalObject, JSObject* object, const Identifier& key, AutomockWrite how, unsigned& attributes, bool& isValue)
+{
+    auto scope = DECLARE_THROW_SCOPE(JSC::getVM(globalObject));
+
+    attributes = 0;
+    JSValue stored = getOwnPropertyStorage(globalObject, object, key, attributes);
+    RETURN_IF_EXCEPTION(scope, {});
+    isValue = stored && !(attributes & (PropertyAttribute::Accessor | PropertyAttribute::CustomAccessorOrValue));
+    if (how == AutomockWrite::Assigned || (stored && (attributes & PropertyAttribute::CustomAccessorOrValue)))
+        RELEASE_AND_RETURN(scope, object->get(globalObject, key));
+    return isValue ? stored : JSValue();
+}
+
+// Puts `original` in the own property `key` of `object`, which holds `stored`. Where the automock added the property, it goes.
+// A frozen object takes it all the same. Returns false if the property holds `stored` after all: a Proxy has the last word.
+__attribute__((minsize)) static bool putBackInPlace(Zig::GlobalObject* globalObject, JSObject* object, const Identifier& key, JSValue original, JSValue stored, AutomockWrite how, unsigned attributes, bool isValue)
+{
+    auto& vm = JSC::getVM(globalObject);
+    auto scope = DECLARE_THROW_SCOPE(vm);
+
+    bool isOpaque = isOpaqueProperty(globalObject, object, key);
+    RETURN_IF_EXCEPTION(scope, true);
+    auto isOut = [&] {
+        unsigned attributesNow = 0;
+        bool isValueNow = false;
+        return valueInPlace(globalObject, object, key, how, attributesNow, isValueNow) != stored;
+    };
+
+    if (how == AutomockWrite::Added) {
+        {
+            // The test file may have frozen the object.
+            std::optional<VM::DeletePropertyModeScope> ignoreConfigurable;
+            if (!isOpaque)
+                ignoreConfigurable.emplace(vm, VM::DeletePropertyMode::IgnoreConfigurable);
+            JSCell::deleteProperty(object, globalObject, key);
+            RETURN_IF_EXCEPTION(scope, true);
+        }
+        bool isGone = isOut();
+        RETURN_IF_EXCEPTION(scope, true);
+        if (isGone)
+            return true;
+        // The object keeps the property. So the property gets the function that the object inherited.
+    }
+
+    JSC::PutPropertySlot slot(object);
+    object->methodTable()->put(object, globalObject, key, original, slot);
+    RETURN_IF_EXCEPTION(scope, true);
+    bool isUndone = isOut();
+    RETURN_IF_EXCEPTION(scope, true);
+    if (isUndone || !isValue)
+        return isUndone;
+    {
+        ThroughLockOfBuiltins throughLock(vm, isOpaque);
+        putOwnValue(globalObject, object, key, original, attributes, isOpaque);
+        RETURN_IF_EXCEPTION(scope, true);
+    }
+    RELEASE_AND_RETURN(scope, isOut());
+}
+
+// `copy` is an array, or the copy that an automock made of a module namespace object. Puts the function that each spy in it spies on in the place of the spy.
+// Returns false if a spy stays: a Proxy has the last word.
+__attribute__((minsize)) static bool takeSpiesOutOfCopy(Zig::GlobalObject* globalObject, JSObject* copy)
+{
+    auto& vm = JSC::getVM(globalObject);
+    auto scope = DECLARE_THROW_SCOPE(vm);
+
+    if (auto* array = dynamicDowncast<JSC::JSArray>(copy); array && !JSC::hasAnyArrayStorage(array->indexingType())) {
+        // Only an array of this kind holds a function.
+        if (!JSC::hasContiguous(array->indexingType()))
+            return true;
+        for (unsigned i = 0; i < array->length(); ++i) {
+            JSValue spied = array->canGetIndexQuickly(i) ? spiedByAutomockOfTestFile(array->getIndexQuickly(i)) : JSValue();
+            if (!spied)
+                continue;
+            array->putDirectIndex(globalObject, i, spied);
+            RETURN_IF_EXCEPTION(scope, true);
+        }
+        return true;
+    }
+
+    bool areAllOut = true;
+    JSC::PropertyNameArrayBuilder keys(vm, JSC::PropertyNameMode::StringsAndSymbols, JSC::PrivateSymbolMode::Exclude);
+    copy->methodTable()->getOwnPropertyNames(copy, globalObject, keys, JSC::DontEnumPropertiesMode::Include);
+    RETURN_IF_EXCEPTION(scope, true);
+    for (const auto& key : keys) {
+        unsigned attributes = 0;
+        bool isValue = false;
+        JSValue member = valueInPlace(globalObject, copy, key, AutomockWrite::Replaced, attributes, isValue);
+        RETURN_IF_EXCEPTION(scope, true);
+        JSValue spied = isValue ? spiedByAutomockOfTestFile(member) : JSValue();
+        if (!spied)
+            continue;
+        bool isOut = putBackInPlace(globalObject, copy, key, spied, member, AutomockWrite::Replaced, attributes, isValue);
+        RETURN_IF_EXCEPTION(scope, true);
+        areAllOut &= isOut;
+    }
+    return areAllOut;
+}
+
+// What undoAutomockWrite() found of the arrays in the properties. Many properties can have one array, which is looked at once.
+struct ArraysInPlace {
+    // Whether the array is a copy that the test file left as the automock made it. What it is a copy of then goes back.
+    UncheckedKeyHashMap<JSCell*, bool> isAsMade;
+    // Holds each array of which `isAsMade` has the address.
+    MarkedArgumentBuffer arrays;
+};
+
+// Takes what an automock stored in the own property `key` of `object` out again. `write` is what didStoreInPlace() kept for the key.
+// Only what an automock stored goes: a value that the test file stored there since is the file's.
+__attribute__((minsize)) static void undoAutomockWrite(Zig::GlobalObject* globalObject, JSC::JSWeakMap* copies, ArraysInPlace& arrays, JSObject* object, const Identifier& key, JSValue write)
+{
+    auto& vm = JSC::getVM(globalObject);
+    auto scope = DECLARE_THROW_SCOPE(vm);
+
+    auto* ofCopy = dynamicDowncast<JSC::JSArray>(write);
+    auto how = static_cast<AutomockWrite>((ofCopy ? ofCopy->getIndexQuickly(2) : write).asInt32());
+    JSValue copy = ofCopy ? ofCopy->getIndexQuickly(1) : JSValue();
+
+    unsigned attributes = 0;
+    bool isValue = false;
+    JSValue stored = valueInPlace(globalObject, object, key, how, attributes, isValue);
+    RETURN_IF_EXCEPTION(scope, );
+    if (!stored)
+        return;
+
+    bool isOut = true;
+    JSValue original = spiedByAutomockOfTestFile(stored);
+    bool isArray = !original && JSC::isArray(globalObject, stored);
+    RETURN_IF_EXCEPTION(scope, );
+    if (!original && stored == copy)
+        original = ofCopy->getIndexQuickly(0);
+    if (isArray) {
+        if (arrays.isAsMade.add(stored.asCell(), false).isNewEntry) {
+            arrays.arrays.append(stored);
+            // The copy that the test file changed has what the file did, so it stays, without the spies. So does an array of the file's own.
+            auto* madeByAutomock = dynamicDowncast<JSC::JSArray>(stored);
+            bool isAsMade = madeByAutomock && (stored == copy || copies->has(madeByAutomock)) && hasElementsAsMade(globalObject, madeByAutomock, copies);
+            RETURN_IF_EXCEPTION(scope, );
+            if (!isAsMade) {
+                isOut = takeSpiesOutOfCopy(globalObject, asObject(stored));
+                RETURN_IF_EXCEPTION(scope, );
+            }
+            arrays.isAsMade.set(stored.asCell(), isAsMade);
+        }
+        if (!arrays.isAsMade.get(stored.asCell()))
+            original = JSValue();
+    }
+    if (original)
+        isOut = putBackInPlace(globalObject, object, key, original, stored, how, attributes, isValue);
+    RETURN_IF_EXCEPTION(scope, );
+    if (!isOut) {
+        String owner = object->type() == ProxyObjectType ? String("a Proxy"_s) : JSObject::calculatedClassName(object);
+        throwTypeError(globalObject, scope, makeString("Cannot take the spy of a { spy: true } mock out of the `"_s, propertyKeyForMessage(key), "` property of "_s, owner, " because the object did not take the value back"_s));
+    }
+}
+
+// The next test file shares the objects, so what this file's `{ spy: true }` automocks stored on them has to go.
+// Keeps going after an exception and rethrows the first one at the end.
+__attribute__((minsize)) static NEVER_INLINE void undoAutomockWrites(Zig::GlobalObject* globalObject)
+{
+    auto& vm = JSC::getVM(globalObject);
+    auto scope = DECLARE_THROW_SCOPE(vm);
+    JSC::Exception* firstException = nullptr;
+
+    // The journal stays in its place meanwhile: a Proxy trap hit while one write is undone may run an automock, or make an instance of a spied class.
+    while (JSC::JSArray* journal = automockJournalIfAny(globalObject)) {
+        auto* writes = mapOf(journal, WritesOfObjects);
+        auto* copies = mapOf(journal, CopiesToSpy);
+        MarkedArgumentBuffer entries;
+        writes->takeSnapshot(entries);
+        ArraysInPlace arrays;
+        for (size_t i = 0; i + 1 < entries.size(); i += 2) {
+            JSObject* object = asObject(entries.at(i));
+            JSObject* writesByKey = asObject(entries.at(i + 1));
+            writes->remove(object);
+            JSC::PropertyNameArrayBuilder keys(vm, JSC::PropertyNameMode::StringsAndSymbols, JSC::PrivateSymbolMode::Exclude);
+            writesByKey->methodTable()->getOwnPropertyNames(writesByKey, globalObject, keys, JSC::DontEnumPropertiesMode::Include);
+            if (!keepFirstException(scope, firstException))
+                return;
+            // `constructor` comes last, so that the error of an object that refuses names a property that the test file knows.
+            for (bool isConstructor : { false, true }) {
+                for (const auto& key : keys) {
+                    if ((key == vm.propertyNames->constructor) != isConstructor)
+                        continue;
+                    JSValue write = writesByKey->get(globalObject, key);
+                    if (!scope.exception()) [[likely]]
+                        undoAutomockWrite(globalObject, copies, arrays, object, key, write);
+                    if (!keepFirstException(scope, firstException))
+                        return;
+                }
+            }
+        }
+        if (!entries.isEmpty())
+            continue;
+
+        // Whoever took a copy while the file ran still has it, so the spies in every copy go too.
+        globalObject->mockModule.automockWrites.clear();
+        copies->takeSnapshot(entries);
+        UncheckedKeyHashSet<JSCell*> seen;
+        for (size_t i = 0; i + 1 < entries.size(); i += 2) {
+            if (auto* record = dynamicDowncast<JSC::JSArray>(entries.at(i + 1))) {
+                forEachCopyUnder(globalObject, uncheckedDowncast<JSC::JSArray>(entries.at(i)), record, seen, [&](JSC::JSArray* array, JSC::JSArray*) {
+                    takeSpiesOutOfCopy(globalObject, array);
+                    return keepFirstException(scope, firstException);
+                });
+            } else
+                takeSpiesOutOfCopy(globalObject, asObject(entries.at(i)));
+            if (!keepFirstException(scope, firstException))
+                return;
+        }
+    }
+    if (firstException)
+        throwException(globalObject, scope, firstException);
+}
+
 enum class AutomockKind : uint8_t {
     Keep,
     Array,
@@ -2535,15 +3075,22 @@ struct Automocker {
     Zig::GlobalObject* globalObject;
     bool spy;
     bool leaveOriginalAlone;
+    AutomockLifetime lifetime;
     JSC::JSMap* replacements;
     // Work list of (original, replacement, AutomockKind) triples.
     JSC::MarkedArgumentBuffer pending {};
     JSC::JSFunction* accessor { nullptr };
 
+    // The copies of arrays that are no element of a copy: a property got them in place, or the copy of a module namespace object, or the caller. For recordElementsOfCopies().
+    JSC::MarkedArgumentBuffer copiedArrays {};
+
+    // Whether what this automock stores in place is for undoAutomockWrites() to take out.
+    bool storesInPlaceForTestFile() const { return spy && !leaveOriginalAlone && lifetime == AutomockLifetime::TestFile; }
     AutomockKind kindOf(JSValue);
     JSValue replacementFor(JSValue, AutomockRole = AutomockRole::Member);
     void mockElements(JSObject* original, JSC::JSArray* replacement);
     void mockMembers(JSObject* original, JSObject* replacement, AutomockKind);
+    void recordElementsOfCopies();
 };
 
 // JSC inlines all 5 KB of objectPrototypeToString() into every caller.
@@ -2608,6 +3155,11 @@ __attribute__((minsize)) JSValue Automocker::replacementFor(JSValue value, Autom
     JSObject* replacement = nullptr;
     switch (kind) {
     case AutomockKind::Keep:
+        // An automock that stays for every test file spies in place, and keeps the spy that a test file's automock stored there. From here on that spy stays too.
+        if (lifetime == AutomockLifetime::EveryTestFile && spy && !leaveOriginalAlone && original->type() == JSC::InternalFunctionType) {
+            if (auto* mock = dynamicDowncast<JSMockFunction>(original); mock && mock->isAutomock)
+                mock->standsForEveryTestFile = true;
+        }
         return value;
     case AutomockKind::Array:
         replacement = JSC::constructEmptyArray(globalObject, nullptr);
@@ -2641,6 +3193,7 @@ __attribute__((minsize)) JSValue Automocker::replacementFor(JSValue value, Autom
     case AutomockKind::Function: {
         auto* mock = createMockFunction(vm, globalObject, true);
         mock->isAutomock = true;
+        mock->standsForEveryTestFile = lifetime == AutomockLifetime::EveryTestFile;
         mock->copyNameAndLength(vm, globalObject, value);
         RETURN_IF_EXCEPTION(scope, {});
         if (spy) {
@@ -2654,6 +3207,10 @@ __attribute__((minsize)) JSValue Automocker::replacementFor(JSValue value, Autom
 
     JSC__JSMap__set(replacements, globalObject, JSValue::encode(value), JSValue::encode(replacement));
     RETURN_IF_EXCEPTION(scope, {});
+    if (kind == AutomockKind::Module && storesInPlaceForTestFile()) {
+        didCopyToSpy(globalObject, replacement);
+        RETURN_IF_EXCEPTION(scope, {});
+    }
 
     if (kind != AutomockKind::Array || spy) {
         pending.append(original);
@@ -2694,6 +3251,73 @@ void Automocker::mockElements(JSObject* original, JSC::JSArray* replacement)
 
     scope.release();
     replacement->setLength(globalObject, length, true);
+}
+
+// The automock has given every copy its elements. For the end of the test file, each of `copiedArrays` gets an ElementsRecord.
+__attribute__((minsize)) void Automocker::recordElementsOfCopies()
+{
+    auto& vm = JSC::getVM(globalObject);
+    auto scope = DECLARE_THROW_SCOPE(vm);
+
+    auto* journal = ensureAutomockJournal(globalObject);
+    RETURN_IF_EXCEPTION(scope, );
+    auto* copies = mapOf(journal, CopiesToSpy);
+
+    // An array gets one record, also if several arrays have it among their elements, or if it has itself.
+    // Nothing leaves `arrays`, so no array is collected while `recordOf` has its address.
+    MarkedArgumentBuffer arrays;
+    MarkedArgumentBuffer records;
+    UncheckedKeyHashMap<JSCell*, unsigned> recordOf;
+    auto record = [&](JSC::JSArray* array) -> JSC::JSArray* {
+        if (auto known = recordOf.find(array); known != recordOf.end())
+            return uncheckedDowncast<JSC::JSArray>(records.at(known->value));
+        MarkedArgumentBuffer parts;
+        parts.append(elementsOf(globalObject, array));
+        RETURN_IF_EXCEPTION(scope, nullptr);
+        parts.append(jsUndefined());
+        auto* made = JSC::constructArray(globalObject, static_cast<JSC::ArrayAllocationProfile*>(nullptr), parts);
+        RETURN_IF_EXCEPTION(scope, nullptr);
+        recordOf.add(array, records.size());
+        arrays.append(array);
+        records.append(made);
+        return made;
+    };
+
+    for (size_t i = 0; i < copiedArrays.size(); ++i) {
+        auto* copy = uncheckedDowncast<JSC::JSArray>(copiedArrays.at(i));
+        if (copies->has(copy))
+            continue;
+        auto* made = record(copy);
+        RETURN_IF_EXCEPTION(scope, );
+        copies->set(vm, copy, made);
+    }
+    for (size_t next = 0; next < arrays.size(); ++next) {
+        auto* array = uncheckedDowncast<JSC::JSArray>(arrays.at(next));
+        // Only an array of these kinds has an array among its elements.
+        if (!JSC::hasContiguous(array->indexingType()) && !JSC::hasAnyArrayStorage(array->indexingType()))
+            continue;
+        MarkedArgumentBuffer ofElements;
+        forEachElement(globalObject, array, array->length(), [&](unsigned i) {
+            JSValue element = elementAt(globalObject, array, i);
+            if (scope.exception() || !element || !JSC::isJSArray(element))
+                return;
+            auto* ofElement = record(uncheckedDowncast<JSC::JSArray>(element));
+            if (scope.exception())
+                return;
+            ofElements.append(ofElement);
+        });
+        RETURN_IF_EXCEPTION(scope, );
+        if (ofElements.hasOverflowed() || arrays.hasOverflowed() || records.hasOverflowed()) [[unlikely]] {
+            throwOutOfMemoryError(globalObject, scope);
+            return;
+        }
+        if (ofElements.isEmpty())
+            continue;
+        auto* recordsOfArrays = JSC::constructArray(globalObject, static_cast<JSC::ArrayAllocationProfile*>(nullptr), ofElements);
+        RETURN_IF_EXCEPTION(scope, );
+        uncheckedDowncast<JSC::JSArray>(records.at(next))->putDirectIndex(globalObject, RecordsOfArrays, recordsOfArrays);
+        RETURN_IF_EXCEPTION(scope, );
+    }
 }
 
 __attribute__((minsize)) void Automocker::mockMembers(JSObject* original, JSObject* replacement, AutomockKind kind)
@@ -2761,10 +3385,21 @@ __attribute__((minsize)) void Automocker::mockMembers(JSObject* original, JSObje
                     continue;
                 JSC::PutPropertySlot slot(replacement);
                 replacement->methodTable()->put(replacement, globalObject, key, mocked, slot);
+                RETURN_IF_EXCEPTION(scope, );
+                if (storesInPlaceForTestFile()) {
+                    auto how = holder == original ? AutomockWrite::Replaced : AutomockWrite::Added;
+                    if (!descriptor.isDataDescriptor())
+                        how = AutomockWrite::Assigned;
+                    didStoreInPlace(globalObject, replacement, key, how, value, dynamicDowncast<JSMockFunction>(mocked) ? JSValue() : mocked);
+                    if (JSC::isJSArray(mocked))
+                        copiedArrays.append(mocked);
+                }
             } else if (isFunction && key == vm.propertyNames->prototype) {
                 uncheckedDowncast<JSMockFunction>(replacement)->setPrototypeProperty(vm, mocked);
             } else {
                 replacement->putDirectMayBeIndex(globalObject, key, mocked);
+                if (kind == AutomockKind::Module && mocked != value && JSC::isJSArray(mocked) && storesInPlaceForTestFile())
+                    copiedArrays.append(mocked);
             }
             RETURN_IF_EXCEPTION(scope, );
         }
@@ -2780,14 +3415,16 @@ __attribute__((minsize)) void Automocker::mockMembers(JSObject* original, JSObje
     }
 }
 
-__attribute__((minsize)) static JSValue automock(Zig::GlobalObject* globalObject, JSValue value, AutomockRole role, bool spy, bool leaveOriginalAlone)
+__attribute__((minsize)) static JSValue automock(Zig::GlobalObject* globalObject, JSValue value, AutomockRole role, bool spy, bool leaveOriginalAlone, AutomockLifetime lifetime)
 {
     auto& vm = JSC::getVM(globalObject);
     auto scope = DECLARE_THROW_SCOPE(vm);
 
-    Automocker automocker { globalObject, spy, leaveOriginalAlone, JSC::JSMap::create(vm, globalObject->mapStructure()) };
+    Automocker automocker { globalObject, spy, leaveOriginalAlone, lifetime, JSC::JSMap::create(vm, globalObject->mapStructure()) };
     JSValue result = automocker.replacementFor(value, role);
     RETURN_IF_EXCEPTION(scope, {});
+    if (result != value && JSC::isJSArray(result) && automocker.storesInPlaceForTestFile())
+        automocker.copiedArrays.append(result);
 
     while (automocker.pending.size()) {
         auto kind = static_cast<AutomockKind>(automocker.pending.takeLast().asInt32());
@@ -2799,13 +3436,17 @@ __attribute__((minsize)) static JSValue automock(Zig::GlobalObject* globalObject
             automocker.mockMembers(original, replacement, kind);
         RETURN_IF_EXCEPTION(scope, {});
     }
+    if (automocker.copiedArrays.size()) [[unlikely]] {
+        automocker.recordElementsOfCopies();
+        RETURN_IF_EXCEPTION(scope, {});
+    }
 
     return result;
 }
 
-JSC::JSValue mockObject(Zig::GlobalObject* globalObject, JSC::JSValue value, bool spy, bool leaveOriginalAlone)
+JSC::JSValue mockObject(Zig::GlobalObject* globalObject, JSC::JSValue value, bool spy, bool leaveOriginalAlone, AutomockLifetime lifetime)
 {
-    return automock(globalObject, value, AutomockRole::Exports, spy, leaveOriginalAlone);
+    return automock(globalObject, value, AutomockRole::Exports, spy, leaveOriginalAlone, lifetime);
 }
 
 JSC_DEFINE_HOST_FUNCTION(jsMockFunctionMockObject, (JSC::JSGlobalObject * lexicalGlobalObject, JSC::CallFrame* callframe))
@@ -2822,7 +3463,9 @@ JSC_DEFINE_HOST_FUNCTION(jsMockFunctionMockObject, (JSC::JSGlobalObject * lexica
         spy = spyValue.toBoolean(globalObject);
     }
 
-    RELEASE_AND_RETURN(scope, JSValue::encode(automock(globalObject, callframe->argument(0), AutomockRole::Member, spy, false)));
+    // What code of the running test file spies on ends with the file. The rest stays, as what a preload spies on does.
+    bool standsForEveryTestFile = spy && (isPreloadRunning(globalObject) || Bun::isCalledForEveryTestFile(globalObject, callframe));
+    RELEASE_AND_RETURN(scope, JSValue::encode(automock(globalObject, callframe->argument(0), AutomockRole::Member, spy, false, standsForEveryTestFile ? AutomockLifetime::EveryTestFile : AutomockLifetime::TestFile)));
 }
 
 JSC_DEFINE_HOST_FUNCTION(jsMockFunctionIsMockFunction, (JSC::JSGlobalObject*, JSC::CallFrame* callframe))
@@ -2950,11 +3593,6 @@ __attribute__((minsize)) static void wrapFunction(Zig::GlobalObject* globalObjec
         return;
     }
     mock->setInitialImplementation(globalObject, function);
-}
-
-static String propertyKeyForMessage(const Identifier& key)
-{
-    return key.isSymbol() ? makeString("Symbol("_s, key.string(), ')') : key.string();
 }
 
 static String propertyKeyForFunctionName(const Identifier& key)
@@ -3156,7 +3794,8 @@ __attribute__((minsize)) static JSC::EncodedJSValue spyOn(JSC::JSGlobalObject* l
                 RETURN_IF_EXCEPTION(scope, {});
             }
 
-            if (dynamicDowncast<JSMockFunction>(value)) {
+            if (auto* existing = dynamicDowncast<JSMockFunction>(value)) {
+                existing->didSpyOnAgain(globalObject);
                 return JSValue::encode(value);
             }
         }
@@ -3235,7 +3874,8 @@ __attribute__((minsize)) static JSC::EncodedJSValue spyOn(JSC::JSGlobalObject* l
             return {};
         }
     }
-    if (dynamicDowncast<JSMockFunction>(original)) {
+    if (auto* existing = dynamicDowncast<JSMockFunction>(original)) {
+        existing->didSpyOnAgain(globalObject);
         return JSValue::encode(original);
     }
 

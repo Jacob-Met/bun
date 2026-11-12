@@ -426,7 +426,7 @@ declare module "bun:test" {
      * kept.
      *
      * With `{ spy: true }`, functions keep their implementation, arrays keep their elements, and objects are modified
-     * in place instead of copied.
+     * in place instead of copied. The spies stay until the test file ends, also after `vi.restoreAllMocks()`.
      *
      * @example
      * ```ts
