@@ -44,12 +44,12 @@ describe.concurrent("bunfig.toml logLevel", () => {
     forms.flatMap(([name, cmd]) => levels.map((level): [string, Level, string[]] => [name, level, cmd]));
   const script = `console.log("ran");\n`;
 
-  async function run(name: string, cmd: string[], files: Record<string, string>) {
+  async function run(name: string, cmd: string[], files: Record<string, string>, env: Record<string, string> = {}) {
     using dir = tempDir("bunfig-log-level", { "m.js": script, "no-extension": script, ...files });
     await using proc = Bun.spawn({
       cmd: [bunExe(), ...cmd],
       argv0: name.startsWith("node ") ? "node" : undefined,
-      env: { ...bunEnv, HOME: String(dir), XDG_CONFIG_HOME: undefined, BUNFIG_LOG_LEVEL_UNSET: undefined },
+      env: { ...bunEnv, HOME: String(dir), XDG_CONFIG_HOME: undefined, BUNFIG_LOG_LEVEL_UNSET: undefined, ...env },
       cwd: String(dir),
       stdout: "pipe",
       stderr: "pipe",
@@ -133,6 +133,63 @@ describe.concurrent("bunfig.toml logLevel", () => {
       ] as const)(`${name}, logLevel %s`, async (level, logs) => {
         const { stdout, exitCode } = await run(name, cmd, { "bunfig.toml": logLevel(level), ...files });
         expect({ stdout, exitCode }).toEqual({ stdout: logs, exitCode: 0 });
+      });
+    }
+  });
+
+  // `fetch()` prints its headers for BUN_CONFIG_VERBOSE_FETCH or its `verbose` option, and not for a log level.
+  describe("the headers of a fetch()", () => {
+    const files = {
+      "m.js": `using server = Bun.serve({ port: 0, fetch: () => new Response("ok") });\nconst response = await fetch(server.url, { headers: { "x-probe": "1" } });\nconsole.log(await response.text());\n`,
+    };
+
+    for (const [name, cmd] of [early, late]) {
+      test.each([
+        [{}, 0],
+        [{ BUN_CONFIG_VERBOSE_FETCH: "true" }, 1],
+      ] as const)(`${name}, logLevel debug, env %j`, async (env, headerLines) => {
+        const { stdout, stderr, exitCode } = await run(name, cmd, { "bunfig.toml": logLevel("debug"), ...files }, env);
+        expect({
+          stdout,
+          headerLines: stderr.split("\n").filter(line => line.includes("x-probe: 1")).length,
+          exitCode,
+        }).toEqual({
+          stdout: "ok\n",
+          headerLines,
+          exitCode: 0,
+        });
+      });
+    }
+  });
+
+  // The type checker reads a repeated key of a package.json as TypeScript does: the last value counts.
+  describe("the type checker", () => {
+    const compilerOptions = {
+      strict: true,
+      noEmit: true,
+      module: "esnext",
+      moduleResolution: "bundler",
+      lib: ["es5"],
+      types: [],
+    };
+    const files = {
+      "tsconfig.json": JSON.stringify({ compilerOptions }),
+      "console.d.ts": `declare var console: { log(...args: unknown[]): void };\n`,
+      "m.ts": `import { value } from "dep";\nconst n: number = value;\nconsole.log("ran", n);\n`,
+      "node_modules/dep/package.json": `{ "name": "dep", "exports": { ".": { "types": "./string.d.ts", "types": "./number.d.ts", "default": "./index.js" } } }`,
+      "node_modules/dep/string.d.ts": `export const value: string;\n`,
+      "node_modules/dep/number.d.ts": `export const value: number;\n`,
+      "node_modules/dep/index.js": `exports.value = 1;\n`,
+    };
+    const forms: Form[] = [
+      ["bun --check ./m.ts", ["--check", "./m.ts"]],
+      ["bun run --check ./m.ts", ["run", "--check", "./m.ts"]],
+    ];
+
+    for (const [name, cmd] of forms) {
+      test.each(["not set", "error"] as const)(`${name}, logLevel %s`, async level => {
+        const { stdout, exitCode } = await run(name, cmd, { "bunfig.toml": logLevel(level), ...files });
+        expect({ stdout, exitCode }).toEqual({ stdout: "ran 1\n", exitCode: 0 });
       });
     }
   });
