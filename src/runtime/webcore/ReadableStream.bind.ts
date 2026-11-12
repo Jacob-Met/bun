@@ -9,7 +9,8 @@ const members = {
   isClosed: { getter: b.bool, pure: true },
   pull: {
     ...js,
-    args: { view: b.any, flags: b.any },
+    /** `later`: a Node stream asks whose push would reach script. A pipe then gives it no bytes in the call: `FileReader::delivers_later`. */
+    args: { view: b.any, flags: b.any, later: b.bool.loose },
     returns: b.any.returning("number", "boolean", "Promise", "Uint8Array", "undefined"),
     passThis: true,
     length: 1,

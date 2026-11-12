@@ -1570,12 +1570,13 @@ it("child.stdout.pause() after flowing stops native reads and blocks the child",
   }
 });
 
-// child.stdout and child.stderr read ahead: `_read()` pushes each native pull
-// result synchronously, so while the stream flows Readable holds the next chunk
-// in its buffer when a 'data' listener runs. destroy() left that chunk there and
-// flow() emitted it after destroy() returned, with `destroyed === true`. Node's
-// child stdio is a net.Socket that pushes asynchronously, so no 'data' follows
-// destroy() there.
+// Node's child stdio is a net.Socket: its handle reports each read from a
+// callback of its own and destroy() closes the handle, so no 'data' and no 'end'
+// follow destroy(). child.stdout and child.stderr used to push each native pull
+// result inside `_read()`, so while the stream flowed Readable held the next
+// chunk in its buffer when a 'data' listener ran, and flow() emitted it after
+// destroy() returned. A stream that flows gets each result in a promise job
+// now, and Readable drops a result that arrives after destroy().
 it.concurrent.each(["stdout", "stderr"] as const)(
   "child.%s.destroy() inside a 'data' listener stops 'data' and 'end'",
   async name => {
@@ -1597,9 +1598,10 @@ it.concurrent.each(["stdout", "stderr"] as const)(
         }
         bytes += d.length;
         // Destroy as soon as another chunk is already buffered behind this
-        // one: that is the chunk that used to follow destroy(). If the reader
-        // never gets ahead of this listener, destroy half way instead.
-        if (stream.readableLength > 0 || bytes >= SIZE / 2) {
+        // one: that is the chunk that used to follow destroy(). The reader
+        // does not get ahead of this listener any more, so destroy after a
+        // few chunks, with most of the output still to come.
+        if (stream.readableLength > 0 || bytes >= SIZE / 32) {
           destroyed = true;
           stream.destroy();
           c.kill();
@@ -1810,4 +1812,85 @@ describe.skipIf(!isPosix)("child.stdout pull nested in a 'data' event", () => {
     // several seconds, and the fixtures give up on their markers after 15 s so
     // their own error, not a test timeout, is what gets reported.
   }, 30_000);
+});
+
+// A loop of `await once(stream, "data")` has no 'data' listener between two chunks, for the length of one promise job
+// or of one nextTick. Node's child stdio is a libuv handle: every chunk comes in a callback of its own, after the
+// nextTicks and the promise jobs of the one before, so the loop gets every byte. `_read()` pushed what the native pull
+// returned inside the call, and flow() emitted those chunks back to back: all but the first to no listener.
+//
+// The fixture has the tail in the pipe while the listeners of the first chunk run, and the tail is more than one read.
+describe.skipIf(!isPosix)("child stdio read one event at a time", () => {
+  // The stream and the form of each consumer: see the fixture.
+  async function consume(...consumers: string[]) {
+    using dir = tempDir("child-stdio-once-data", {});
+    await using proc = Bun.spawn({
+      cmd: [
+        bunExe(),
+        path.join(import.meta.dir, "fixtures", "child-process-stdio-once-data.js"),
+        String(dir),
+        ...consumers,
+      ],
+      env: bunEnv,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    return { consumers: stdout === "" ? stdout : JSON.parse(stdout), stderr, exitCode };
+  }
+
+  it("a loop of once('data') gets every byte", async () => {
+    const all = { exitCode: 0, sawEnd: true, length: 4 + 96 * 1024, head: true, tail: true };
+    expect(
+      await consume("stdout:job", "stdout:tick", "stdout:pause", "stdout:beside", "stdout:race", "stderr:tick"),
+    ).toEqual({
+      consumers: {
+        "stdout:job": all,
+        "stdout:tick": all,
+        "stdout:pause": all,
+        "stdout:beside": all,
+        "stdout:race": all,
+        "stderr:tick": all,
+      },
+      stderr: "",
+      exitCode: 0,
+    });
+  });
+
+  // #48514. The push inside `_read()` left the tail in the buffer of the stream with no 'readable' event. The child
+  // holds the pipe open until the listener has every byte, so nothing more came.
+  it("a 'readable' listener that takes all that is buffered hears of the bytes that follow", async () => {
+    expect(await consume("stdout:readable")).toEqual({
+      consumers: {
+        "stdout:readable": { exitCode: 0, sawEnd: true, length: (64 + 96) * 1024, head: true, tail: true },
+      },
+      stderr: "",
+      exitCode: 0,
+    });
+  });
+
+  // libuv reads what the pipe holds before it reports the exit of the child, and a socket's 'close' comes after its
+  // 'end' listeners and their promise jobs. So a 'data' listener has every byte at 'exit', and a `for await` loop is
+  // done before the ChildProcess emits 'close'.
+  it.skipIf(!isLinux)("'exit' and 'close' come after the output of a child that is gone", async () => {
+    const all = { exitCode: 0, sawEnd: true, length: 4 + 96 * 1024, head: true, tail: true };
+    expect(await consume("stdout:exit", "stdout:iterate")).toEqual({
+      consumers: {
+        "stdout:exit": { ...all, atExit: all.length },
+        "stdout:iterate": { ...all, closedInLoop: false },
+      },
+      stderr: "",
+      exitCode: 0,
+    });
+  });
+
+  // Node has read the pipe by then. Here a stream that nothing consumes yet answers its read() inside the call.
+  it("read() inside 'exit' returns what the child wrote", async () => {
+    const child = spawn("sh", ["-c", "printf AAAABB"], { stdio: ["ignore", "pipe", "ignore"] });
+    const closed = once(child, "close");
+    const { promise, resolve } = Promise.withResolvers<Buffer | null>();
+    child.on("exit", () => resolve(child.stdout!.read()));
+    expect(String(await promise)).toBe("AAAABB");
+    await closed;
+  });
 });

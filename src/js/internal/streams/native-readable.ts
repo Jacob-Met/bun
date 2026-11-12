@@ -13,6 +13,8 @@ const transferToNativeReadable: (stream: ReadableStream) => void = $newCppFuncti
 );
 const { errorOrDestroy } = require("internal/streams/destroy");
 
+const PromiseResolve = Promise.$resolve.bind(Promise);
+
 const kRefCount = Symbol("refCount");
 const kCloseState = Symbol("closeState");
 const kConstructed = Symbol("constructed");
@@ -20,8 +22,11 @@ const kHighWaterMark = Symbol("highWaterMark");
 const kPendingRead = Symbol("pendingRead");
 const kHasResized = Symbol("hasResized");
 const kRemainingChunk = Symbol("remainingChunk");
+const kViewSize = Symbol("viewSize");
 
 const MIN_BUFFER_SIZE = 512;
+// What the native reader of a file reads at once.
+const LARGE_VIEW_SIZE = 256 * 1024;
 let dynamicallyAdjustChunkSize = (_?) => (
   (_ = process.env.BUN_DISABLE_DYNAMIC_CHUNK_SIZE !== "1"),
   (dynamicallyAdjustChunkSize = () => _)
@@ -39,6 +44,8 @@ interface NativeReadable extends $Node.Readable {
   [kHighWaterMark]: number;
   [kHasResized]: boolean;
   [kRemainingChunk]: Buffer | undefined;
+  // The size of the view of a stream that flows, once a read has filled a view. 0: the size that Readable asks for.
+  [kViewSize]: number;
   debugId: number;
 }
 
@@ -47,7 +54,8 @@ interface NativePtr {
   onDrain: (chunk: any) => void;
   start: (highWaterMark: number) => number;
   drain: () => any;
-  pull: (view: any, closer: any) => any;
+  // `later`: a push inside the call would reach script. A pipe then answers with a promise, also when it has bytes.
+  pull: (view: any, closer: any, later?: boolean) => any;
   updateRef: (ref: boolean) => void;
   cancel: (error: any) => void;
   setFlowing?: (flowing: boolean) => void;
@@ -77,6 +85,7 @@ function constructNativeReadable(readableStream: ReadableStream, options: $Node.
   stream[kPendingRead] = false;
   stream[kHasResized] = !dynamicallyAdjustChunkSize();
   stream[kCloseState] = [false];
+  stream[kViewSize] = 0;
 
   const highWaterMark = options.highWaterMark;
   stream[kHighWaterMark] = typeof highWaterMark === "number" ? highWaterMark : 256 * 1024;
@@ -115,12 +124,14 @@ function ensureConstructed(this: NativeReadable, cb: null | (() => void)) {
 // This is so the consumer of the stream can terminate the stream early if they know
 // how many bytes they want to read (ie. when reading only part of a file)
 // ObjectDefinePrivateProperty(NativeReadable.prototype, "_getRemainingChunk", );
+// The view that the next pull reads into. Script never sees it unless a read fills it: see `handleNumberResult`.
 function getRemainingChunk(stream: NativeReadable, maxToRead?: number) {
   maxToRead ??= stream[kHighWaterMark] as number;
+  var size = (stream._readableState.flowing === true && stream[kViewSize]) || maxToRead;
+  if (size < MIN_BUFFER_SIZE) size = MIN_BUFFER_SIZE;
   var chunk = stream[kRemainingChunk];
-  if ((chunk?.byteLength ?? 0) < MIN_BUFFER_SIZE) {
-    var size = maxToRead > MIN_BUFFER_SIZE ? maxToRead : MIN_BUFFER_SIZE;
-    stream[kRemainingChunk] = chunk = Buffer.alloc(size);
+  if (chunk?.byteLength !== size) {
+    stream[kRemainingChunk] = chunk = Buffer.allocUnsafeSlow(size);
   }
   $debug(`[${stream.debugId}] getRemainingChunk, ${chunk?.byteLength} bytes`);
   return chunk;
@@ -141,6 +152,12 @@ function read(this: NativeReadable, maxToRead: number) {
     this.push(null);
     return;
   }
+  // A push inside `_read()` reaches script when the stream flows or has a 'readable' listener: Readable emits it before the
+  // nextTicks and promise jobs of the chunk before, and no 'readable' follows a read(n) that took the whole buffer. Node's
+  // sources never push there. So a result that the source has at once is then handled in a promise job, as the reaction of
+  // a pull that waited is. A stream that nothing consumes yet answers read() inside the call.
+  const state = this._readableState;
+  const later = state.flowing === true || state.readableListening;
   if (!this[kConstructed]) {
     const result: any = ptr.start(this[kHighWaterMark]);
     $debug(`[${this.debugId}] start, initial hwm:`, result);
@@ -148,57 +165,70 @@ function read(this: NativeReadable, maxToRead: number) {
       this[kHasResized] = true;
       this[kHighWaterMark] = Math.min(this[kHighWaterMark], result);
     }
-    if ($isTypedArrayView(result) && result.byteLength > 0) {
-      pushAndCheck(this, result);
-    }
-    const drainResult = ptr.drain();
+    const started = $isTypedArrayView(result) && result.byteLength > 0 ? result : undefined;
+    const drained = ptr.drain();
     this[kConstructed] = true;
-    $debug(`[${this.debugId}] drain result: ${drainResult?.byteLength ?? "null"}`);
-    if ((drainResult?.byteLength ?? 0) > 0) {
-      pushAndCheck(this, drainResult);
+    $debug(`[${this.debugId}] drain result: ${drained?.byteLength ?? "null"}`);
+    const hasDrained = (drained?.byteLength ?? 0) > 0;
+    if (later && (started !== undefined || hasDrained)) {
+      // What the source had before its start: one chunk in each job. The read that follows the last push pulls.
+      this[kPendingRead] = true;
+      let job = PromiseResolve();
+      if (started !== undefined && hasDrained) job = job.then(() => pushAndCheck(this, started));
+      return job.then(() => {
+        this[kPendingRead] = false;
+        pushAndCheck(this, hasDrained ? drained : started);
+      });
     }
+    if (started !== undefined) pushAndCheck(this, started);
+    if (hasDrained) pushAndCheck(this, drained);
   }
   const chunk = getRemainingChunk(this, maxToRead);
-  var result = ptr.pull(chunk, this[kCloseState]);
+  var result = ptr.pull(chunk, this[kCloseState], later);
   $assert(result !== undefined);
   $debug(
     `[${this.debugId}] pull ${chunk?.byteLength} bytes, result: ${$isPromise(result) ? "<pending>" : $isTypedArrayView(result) ? `<${result.byteLength} bytes>` : result}, closeState: ${this[kCloseState][0]}`,
   );
-  if ($isPromise(result)) {
+  if (later || $isPromise(result)) {
     this[kPendingRead] = true;
-    return result.then(
+    // Only a regular file answers a stream that flows in the call, and a read that fills the view has more behind it.
+    // The next views are as large as the reads that its native reader makes: the same bytes take fewer reads.
+    if (result === chunk.byteLength && state.flowing === true && ptr.setFlowing) this[kViewSize] = LARGE_VIEW_SIZE;
+    return ($isPromise(result) ? result : PromiseResolve(result)).then(
       result => {
         $debug(
           `[${this.debugId}] pull, resolved: ${$isTypedArrayView(result) ? `<${result.byteLength} bytes>` : result}, closeState: ${this[kCloseState][0]}`,
         );
         this[kPendingRead] = false;
-        this[kRemainingChunk] = handleResult(this, result, chunk, this[kCloseState][0]);
+        handleResult(this, result, chunk, this[kCloseState][0]);
       },
       reason => {
         errorOrDestroy(this, reason);
       },
     );
   } else {
-    this[kRemainingChunk] = handleResult(this, result, chunk, this[kCloseState][0]);
+    handleResult(this, result, chunk, this[kCloseState][0]);
   }
 }
 
+// Sets the view of the next pull before any push: a listener can read again inside the push.
 function handleResult(stream: NativeReadable, result: any, chunk: Buffer | undefined, isClosed: boolean) {
   if (typeof result === "number") {
     $debug(`[${stream.debugId}] handleResult(${result})`);
     if (result >= stream[kHighWaterMark] && !stream[kHasResized] && !isClosed) {
       adjustHighWaterMark(stream);
     }
-    return handleNumberResult(stream, result, chunk, isClosed);
+    handleNumberResult(stream, result, chunk, isClosed);
   } else if (typeof result === "boolean") {
     $debug(`[${stream.debugId}] handleResult(${result})`, chunk, isClosed);
+    stream[kRemainingChunk] = (chunk?.byteLength ?? 0) > 0 ? chunk : undefined;
     process.nextTick(pushEof, stream);
-    return (chunk?.byteLength ?? 0) > 0 ? chunk : undefined;
   } else if ($isTypedArrayView(result)) {
     if (result.byteLength >= stream[kHighWaterMark] && !stream[kHasResized] && !isClosed) {
       adjustHighWaterMark(stream);
     }
-    return handleArrayBufferViewResult(stream, result, chunk, isClosed);
+    stream[kRemainingChunk] = chunk;
+    handleArrayBufferViewResult(stream, result, isClosed);
   } else {
     $assert(false, "Invalid result from pull");
   }
@@ -219,28 +249,31 @@ function pushAndCheck(stream: NativeReadable, chunk: Buffer | ArrayBufferView) {
   }
 }
 
-function handleNumberResult(stream: NativeReadable, result: number, chunk: Buffer | undefined, isClosed: boolean) {
+// A chunk that script gets never shares its ArrayBuffer with the view of a later pull: script can transfer the chunk while
+// that pull is on its way. A read that fills the view gives the view away. A shorter one is copied out, and the view,
+// which is not zero-filled, is read into again.
+function handleNumberResult(stream: NativeReadable, result: number, view: Buffer | undefined, isClosed: boolean) {
   if (result > 0) {
-    const slice = chunk!.subarray(0, result);
-    chunk = slice.byteLength < chunk!.byteLength ? chunk!.subarray(result) : undefined;
-    if (slice.byteLength > 0) {
-      pushAndCheck(stream, slice);
+    let chunk: Buffer;
+    if (result === view!.byteLength) {
+      chunk = view!;
+      stream[kRemainingChunk] = undefined;
+    } else {
+      chunk = Buffer.allocUnsafeSlow(result);
+      view!.copy(chunk, 0, 0, result);
+      stream[kRemainingChunk] = view;
     }
+    pushAndCheck(stream, chunk);
+  } else {
+    stream[kRemainingChunk] = view;
   }
 
   if (isClosed) {
     process.nextTick(pushEof, stream);
   }
-
-  return chunk;
 }
 
-function handleArrayBufferViewResult(
-  stream: NativeReadable,
-  result: ArrayBufferView,
-  chunk: Buffer | undefined,
-  isClosed: boolean,
-) {
+function handleArrayBufferViewResult(stream: NativeReadable, result: ArrayBufferView, isClosed: boolean) {
   if (result.byteLength > 0) {
     pushAndCheck(stream, result);
   }
@@ -248,8 +281,6 @@ function handleArrayBufferViewResult(
   if (isClosed) {
     process.nextTick(pushEof, stream);
   }
-
-  return chunk;
 }
 
 function adjustHighWaterMark(stream: NativeReadable) {
@@ -269,7 +300,8 @@ function destroy(this: NativeReadable, error: any, cb: () => void) {
   }
 }
 
-// `_read()` pushes synchronously, so flow() stays one chunk ahead of the 'data' listener. Node's async sources do not.
+// While nothing consumes the stream, `_read()` pushes inside the call. When the stream flows later, those chunks are
+// ahead of its 'data' listener. Node's sources have none there.
 function dropReadAhead(stream: NativeReadable) {
   const state = stream._readableState;
   // Paused: Node has this buffered too, and a later read() returns it.

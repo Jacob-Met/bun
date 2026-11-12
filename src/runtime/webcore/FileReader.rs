@@ -60,6 +60,14 @@ pub struct FileReader {
     /// path; `pull_into_sink` is the drain-ack resume.
     pub(crate) sink: JsCell<SinkHandle>,
     pub(crate) sink_paused: Cell<bool>,
+    /// The last pull came from a Node stream whose push would reach script (`pull`'s `later`). From an event-driven
+    /// reader it gets no bytes in the call: see `delivers_later`.
+    pub(crate) node_stream: Cell<bool>,
+    /// A parked read is being settled. When no event-loop task is on the stack, its promise reactions run inside
+    /// `settle_pending`: the listeners, their nextTicks and their promise jobs.
+    pub(crate) settling: Cell<bool>,
+    /// `read_later` queued its task.
+    pub(crate) read_task_queued: Cell<bool>,
 }
 
 impl Default for FileReader {
@@ -83,6 +91,9 @@ impl Default for FileReader {
             flowing: Cell::new(true),
             sink: JsCell::new(SinkHandle::None),
             sink_paused: Cell::new(false),
+            node_stream: Cell::new(false),
+            settling: Cell::new(false),
+            read_task_queued: Cell::new(false),
         }
     }
 }
@@ -746,9 +757,117 @@ impl FileReader {
         // A re-entrant cancel() inside `run()` reaches on_reader_done, which drops the across-read ref and lets a GC free this box while the io caller still holds `&mut` into it.
         // SAFETY: see `parent()`.
         let _pin = unsafe { RefPtr::init_ref(self.parent()) };
-        self.pending.with_mut(|p| p.run());
+        self.settle_pending();
+        // A Node stream asked again while its listeners ran. Its read is made now that they are done, and settled
+        // before the next one: the socket is drained before the poll is armed again, as by libuv's read loop.
+        while self.delivers_later() && self.read_for_parked_pull() {}
         // Re-entrant cancel or a nested pull that read to EOF closed the reader; tell the io caller to stop so it does not re-read the captured fd.
         ret && !self.done.get() && !self.reader().is_done()
+    }
+
+    fn settle_pending(&self) {
+        let was_settling = self.settling.replace(true);
+        self.pending.with_mut(|p| p.run());
+        self.settling.set(was_settling);
+    }
+
+    /// A Node stream's push would reach script, and the reader is event-driven (a pipe, a socket, a terminal).
+    /// Node's `_read()` only arms such a handle and libuv reports each read from a callback of its own, so the
+    /// listeners of one chunk, their nextTicks and their promise jobs run before the next chunk. Here every such
+    /// pull is parked, and its bytes settle it from the reader's read callback or from a task, never inside the call.
+    fn delivers_later(&self) -> bool {
+        if !self.node_stream.get() {
+            return false;
+        }
+        #[cfg(unix)]
+        {
+            use bun_io::pipe_reader::PosixFlags;
+            self.reader().flags.contains(PosixFlags::POLLABLE)
+        }
+        #[cfg(windows)]
+        {
+            use bun_io::pipe_reader::WindowsFlags;
+            self.reader().flags.contains(WindowsFlags::POLLABLE)
+        }
+    }
+
+    /// Parks a pull of a Node stream (`delivers_later`). The end and a read error are not chunks: they answer the call.
+    fn park_pull(&self, array: JSValue) -> streams::Result {
+        let has_bytes = !self.buffered.get().is_empty() || !self.reader().buffer().is_empty();
+        if !has_bytes && (self.reader().is_done() || self.read_error.get().is_some()) {
+            return self.end_of_reader();
+        }
+        let global = self.parent_const().global_this();
+        self.pending_value.with_mut(|p| p.set(global, array));
+        #[cfg(windows)]
+        if self.flowing.get() {
+            self.reader().unpause();
+        }
+        bun_core::scoped_log!(FileReader, "onPull() = parked");
+        if !self.settling.get() {
+            self.read_later();
+        }
+        streams::Result::Pending(self.pending.as_ptr())
+    }
+
+    /// Makes the read that a parked pull asked for. `true`: the reader had something and the pull is settled.
+    fn read_for_parked_pull(&self) -> bool {
+        if self.pending.get().state != streams::PendingState::Pending || self.done.get() {
+            return false;
+        }
+        let Some(view) = self.pending_value.get().get() else {
+            return false;
+        };
+        let global = self.parent_const().global_this();
+        let Some(mut array_buffer) = view.as_array_buffer(global) else {
+            return false;
+        };
+        let buffer = array_buffer.slice_mut();
+        if buffer.is_empty() {
+            return false;
+        }
+        let result = readable_stream::SourceContext::on_pull(self, buffer, view);
+        if matches!(result, streams::Result::Pending(_)) {
+            return false;
+        }
+        self.pending.with_mut(|p| p.result = result);
+        self.pending_value
+            .with_mut(|p| p.clear_without_deallocation());
+        self.settle_pending();
+        true
+    }
+
+    /// A pull is parked for a Node stream and no settle is on the stack. When the reader will not settle it by itself
+    /// (it holds bytes, or no poll is armed), one task makes the read. A settle inside a task does not run the
+    /// reactions: the event loop does after the task, so each task delivers one chunk.
+    fn read_later(&self) {
+        let waits_for_poll = self.reader().has_pending_read() && self.buffered.get().is_empty();
+        if waits_for_poll || self.read_task_queued.replace(true) {
+            return;
+        }
+        self.parent_const().increment_count();
+        streams::Pending::run_later(streams::PendingHandler {
+            ctx: self.parent().cast::<core::ffi::c_void>(),
+            handler: Self::run_read_task,
+            release: Self::drop_read_task,
+        });
+    }
+
+    fn run_read_task(ctx: *mut core::ffi::c_void, _: streams::Result) {
+        let parent = ctx.cast::<Source>();
+        // SAFETY: `read_later` took a ref for this task.
+        let this = unsafe { &(*parent).context };
+        this.read_task_queued.set(false);
+        if !this.settling.get() {
+            this.read_for_parked_pull();
+        }
+        // SAFETY: the ref of `read_later`.
+        unsafe { Source::decrement_count(parent) };
+    }
+
+    fn drop_read_task(ctx: *mut core::ffi::c_void) {
+        // SAFETY: the ref of `read_later`.
+        unsafe { Source::decrement_count(ctx.cast::<Source>()) };
     }
 
     pub(crate) fn drain(&self) -> Vec<u8> {
@@ -907,7 +1026,19 @@ impl FileReader {
 
         if flag {
             self.reader().unpause();
-            if !self.reader().is_done() && !self.reader().has_pending_read() {
+            if self.delivers_later() {
+                // Nothing is read for such a stream inside its own call.
+                if self.pending.get().state == streams::PendingState::Pending
+                    && !self.settling.get()
+                    && !self.done.get()
+                {
+                    self.read_later();
+                }
+            // A source that is done has no reader to start: `from_bytes_then_error` has none at all.
+            } else if !self.done.get()
+                && !self.reader().is_done()
+                && !self.reader().has_pending_read()
+            {
                 // Kick off a new read if needed
                 // SAFETY: the reader cell is live for `self`'s lifetime; `read` is
                 // the raw re-entrancy-safe entry (its dispatch runs user JS).
@@ -930,6 +1061,15 @@ impl readable_stream::SourceContext for FileReader {
 
     fn on_start(&self) -> streams::Start {
         Self::on_start(self)
+    }
+
+    fn on_pull_later(&self, later: bool, buffer: &mut [u8], array: JSValue) -> streams::Result {
+        self.node_stream.set(later);
+        if self.delivers_later() {
+            array.ensure_still_alive();
+            return self.park_pull(array);
+        }
+        self.on_pull(buffer, array)
     }
 
     fn on_pull(&self, buffer: &mut [u8], array: JSValue) -> streams::Result {

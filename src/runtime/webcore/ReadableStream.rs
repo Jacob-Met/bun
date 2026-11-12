@@ -801,6 +801,11 @@ pub trait SourceContext: Sized {
 
     fn on_start(&self) -> streams::Start;
     fn on_pull(&self, buf: &mut [u8], view: JSValue) -> streams::Result;
+    /// `on_pull` with `pull`'s `later`: a Node stream asks whose push would reach script. A source can park such a
+    /// pull where `on_pull` would answer with bytes (`FileReader`).
+    fn on_pull_later(&self, _later: bool, buf: &mut [u8], view: JSValue) -> streams::Result {
+        self.on_pull(buf, view)
+    }
     fn on_cancel(&self);
     /// Per-context teardown side-effects (unref pollers, flush pending callbacks,
     /// release handles). **Must NOT free the enclosing `NewSource<Self>` allocation** —
@@ -1237,6 +1242,7 @@ impl<C: SourceContext> NewSource<C> {
         cx: &mut JsScope<'_>,
         view: JsLocal<'_>,
         flags: JsLocal<'_>,
+        later: bool,
     ) -> JsResult<JSValue> {
         let cx = cx.js_thread();
         let global_this = cx.global();
@@ -1249,7 +1255,7 @@ impl<C: SourceContext> NewSource<C> {
         let Some(mut buffer) = view.as_array_buffer(global_this) else {
             return Ok(JSValue::UNDEFINED);
         };
-        let result = self.context.on_pull(buffer.slice_mut(), view);
+        let result = self.context.on_pull_later(later, buffer.slice_mut(), view);
         Self::process_result(this_value.to_js(), &cx, flags.to_js(), result)
     }
 
