@@ -417,6 +417,18 @@ describe.concurrent("[lint] in bunfig.toml", () => {
     return { stdout, stderr, exitCode };
   }
 
+  test.each(["--config", "-c"])("bun %s <path> lint refuses an ambiguous global config", async flag => {
+    const result = await bun({ "other.toml": '[lint.rules]\n"no-eval" = "error"\n', "a.js": 'eval("1")\n' }, [
+      flag,
+      "other.toml",
+      "lint",
+      "--no-script",
+      "a.js",
+    ]);
+    expect(result.exitCode).toBe(2);
+    expect(result.stderr).toContain("use --config=<path> before a command");
+  });
+
   test("--config= before `lint` picks a file other than bunfig.toml", async () => {
     const files = {
       ...eslint,

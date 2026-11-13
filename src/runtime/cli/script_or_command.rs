@@ -105,6 +105,21 @@ fn place_of_first_word(args: &[&[u8]]) -> Option<usize> {
         if arg == b"--" {
             return Some(at + 1).filter(|next| *next < args.len());
         }
+        // The global --config has an optional value, which only accepts the attached
+        // =path form. Otherwise a path followed by a tool command is treated as
+        // the script to run; when the path is a bunfig, that can exit successfully
+        // without running lint (or the other tool) at all.
+        if matches!(arg, b"--config" | b"-c")
+            && args.get(at + 1).is_some_and(|path| !path.starts_with(b"-"))
+            && args
+                .get(at + 2)
+                .is_some_and(|word| matches!(*word, b"check" | b"lint" | b"fmt" | b"compile"))
+        {
+            bun_core::pretty_errorln!(
+                "<r><red>error<r>: use --config=<path> before a command; --config <path> treats the path as a script"
+            );
+            Global::exit(2);
+        }
         // `bun -l fmt`, `bun -ptsconfig.json check`: the flags of these commands count before them too.
         let is_of_next = args.get(at + 1).is_some_and(|next| has_flag(next, arg));
         if evaluates(arg) && !is_of_next {
