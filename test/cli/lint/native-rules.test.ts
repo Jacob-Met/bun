@@ -21,6 +21,53 @@ async function lint(files: Record<string, string>, args: string[] = [], cwd = ".
   return { stdout, stderr, exitCode };
 }
 
+test("import/no-duplicates resolves distinct wildcard exports to their runtime modules", async () => {
+  const files = {
+    "node_modules/icons-pkg/package.json": JSON.stringify({
+      name: "icons-pkg",
+      type: "module",
+      exports: {
+        "./icons/*": {
+          types: "./dist/icon.d.mts",
+          default: "./dist/esm/icons/*.mjs",
+        },
+      },
+    }),
+    "node_modules/icons-pkg/dist/icon.d.mts": "declare const icon: () => string; export default icon;\n",
+    "node_modules/icons-pkg/dist/esm/icons/check.mjs": 'export default () => "check";\n',
+    "node_modules/icons-pkg/dist/esm/icons/x.mjs": 'export default () => "x";\n',
+    "bunfig.toml": '[lint.rules]\n"import/no-duplicates" = "error"\n',
+  };
+  const distinct = await lint(
+    {
+      ...files,
+      "index.ts": [
+        'import Check from "icons-pkg/icons/check";',
+        'import X from "icons-pkg/icons/x";',
+        "export const icons = [Check(), X()];",
+      ].join("\n"),
+    },
+    ["--format=json", "index.ts"],
+  );
+  expect(distinct.exitCode).toBe(0);
+  expect(distinct.stderr).not.toContain("error");
+  expect(problems(distinct.stdout)).toEqual([]);
+
+  const repeated = await lint(
+    {
+      ...files,
+      "index.ts": [
+        'import Check1 from "icons-pkg/icons/check";',
+        'import Check2 from "icons-pkg/icons/check";',
+        "export const icons = [Check1(), Check2()];",
+      ].join("\n"),
+    },
+    ["--format=json", "index.ts"],
+  );
+  expect(repeated.exitCode).toBe(1);
+  expect(problems(repeated.stdout)).toEqual(["index.ts:1 import/no-duplicates", "index.ts:2 import/no-duplicates"]);
+});
+
 type Setting = string | [string, ...unknown[]];
 
 /** Serializes a value as TOML. Strings, numbers, booleans and arrays look the same as in JSON. */

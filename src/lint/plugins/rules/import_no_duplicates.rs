@@ -1,5 +1,6 @@
 use crate::import_resolve::{Resolved, Resolvers};
 use bun_core::strings;
+use bun_lint::modules::Lookup;
 use bun_lint::prelude::*;
 use bun_lint::rule::Plugin;
 use bun_lint_oxlint::import::{ImportImportName, import_declarations, import_entries_of};
@@ -146,7 +147,25 @@ impl NoDuplicates {
         source: &'a [u8],
     ) -> Cow<'a, [u8]> {
         let default_resolver = |path: &'a [u8]| match resolvers.resolve(file, path, false) {
-            Resolved::File(found) => Cow::Owned(found),
+            Resolved::File(found) => {
+                // A package's wildcard exports may map many different runtime modules to a
+                // single declaration file through the "types" condition. Imports of those
+                // modules aren't duplicates just because TypeScript resolves them to the
+                // same .d.ts/.d.mts/.d.cts. Prefer the runtime target when one exists.
+                if (found.ends_with(b".d.ts")
+                    || found.ends_with(b".d.mts")
+                    || found.ends_with(b".d.cts"))
+                    && !path.starts_with(b".")
+                    && !path.starts_with(b"/")
+                {
+                    if let Some(runtime) = file.modules().and_then(|modules| {
+                        modules.resolve_file(file.path(), path, false, &Lookup::RuntimeImport)
+                    }) {
+                        return Cow::Owned(runtime);
+                    }
+                }
+                Cow::Owned(found)
+            }
             Resolved::Nothing | Resolved::Builtin => Cow::Borrowed(path),
         };
         // `/^([^?]*)\?(.*)$/`

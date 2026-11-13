@@ -1324,6 +1324,20 @@ impl Modules for Graph<'_> {
                     found => found?.0.into_owned(),
                 }
             }
+            Lookup::RuntimeImport => {
+                // Unlike eslint-import-resolver-node, this lookup respects package exports
+                // and the "import" condition, while ignoring "types" declarations.
+                let how = AsRequire {
+                    extensions: &[b".mjs", b".js", b".json", b".node"],
+                    module_directories: &[b"node_modules"],
+                    paths: &[],
+                    through_paths: true,
+                    as_import: true,
+                    base_url: None,
+                };
+                let plain = self.resolver_of(b"", &self.store.cwd);
+                plain.resolver.resolve_as_require(specifier, &from, &how)?.0
+            }
             Lookup::Node(extensions) => {
                 self.resolve_as_require((specifier, &from), extensions, &[], &[b"node_modules"])?
             }

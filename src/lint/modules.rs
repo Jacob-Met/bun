@@ -145,6 +145,8 @@ pub type MakeRecord = for<'a> fn(&'a File<'a>) -> Record;
 /// One of eslint-plugin-import's resolvers.
 #[derive(Clone, Debug)]
 pub enum Lookup<'e> {
+    /// Resolves a runtime import, honoring package exports but not declaration-only targets.
+    RuntimeImport,
     /// eslint-import-resolver-typescript, with its `project` option verbatim.
     TypeScript(SmallVec<[&'e [u8]; 1]>),
     /// eslint-import-resolver-node, with its `extensions`.
