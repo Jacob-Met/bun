@@ -629,7 +629,13 @@ impl AddrInfo {
         // SAFETY: `ctx` is the box that `Channel` released for this query, which c-ares answers once.
         let this = unsafe { bun_core::heap::take(ctx.cast::<T>()) };
         if let Some(err) = Error::get(status) {
-            // A failure comes without an `addr_info`.
+            // getaddrinfo (unlike resolve*) maps a missing address family to
+            // ENOTFOUND, matching Node's libuv getaddrinfo behavior.
+            let err = if err == Error::ENODATA {
+                Error::ENOTFOUND
+            } else {
+                err
+            };
             return this.on_addr_info(Err(err));
         }
         // SAFETY: c-ares hands `addr_info` over, and the handler's borrow ends with its call.
@@ -1824,8 +1830,10 @@ impl Error {
 
     pub fn get(rc: i32) -> Option<Error> {
         // https://github.com/nodejs/node/blob/2eff28fb7a93d3f672f80b582f664a7c701569fb/lib/internal/errors.js#L807-L815
-        if rc == ARES_ENODATA || rc == ARES_ENONAME {
-            return Self::get(ARES_ENOTFOUND);
+        // Preserve ENODATA for resolve* queries: the DNS name exists but has
+        // no records of the requested type. getaddrinfo normalizes separately.
+        if rc == ARES_ENONAME {
+            return Some(Error::ENOTFOUND);
         }
 
         if rc == 0 {
