@@ -246,3 +246,53 @@ it("console.takeHeapSnapshot() can be called repeatedly", async () => {
   expect(stderr).toBe("OK\n");
   expect(exitCode).toBe(0);
 });
+
+it("JSC snapshots retain Map keys, Map values, and Set values", () => {
+  class SnapshotMapKeyForHeap {}
+  class SnapshotMapValueForHeap {}
+  class SnapshotSetValueForHeap {}
+
+  const collections = {
+    map: new Map([[new SnapshotMapKeyForHeap(), new SnapshotMapValueForHeap()]]),
+    set: new Set([new SnapshotSetValueForHeap()]),
+  };
+  // Give the collections a real root across the snapshot, not just a temporary.
+  (globalThis as any).__snapshotMapSetCollections = collections;
+  try {
+    const snapshot = Bun.generateHeapSnapshot("jsc");
+    const namesById = new Map<number, string>();
+    for (let n = 0; n < snapshot.nodes.length; n += 4) {
+      namesById.set(snapshot.nodes[n], snapshot.nodeClassNames[snapshot.nodes[n + 2]]);
+    }
+
+    const childrenById = new Map<number, number[]>();
+    for (let e = 0; e < snapshot.edges.length; e += 4) {
+      const from = snapshot.edges[e];
+      const to = snapshot.edges[e + 1];
+      let children = childrenById.get(from);
+      if (!children) childrenById.set(from, (children = []));
+      children.push(to);
+    }
+
+    // Map/Set hold their strong references in a JSCellButterfly. In the
+    // unpatched engine that cell appears, but has no outgoing value edges.
+    const retains = (collectionClass: string, valueClass: string) => {
+      for (const [id, name] of namesById) {
+        if (name !== collectionClass) continue;
+        for (const storageId of childrenById.get(id) ?? []) {
+          if (namesById.get(storageId) !== "Cell Butterfly") continue;
+          if ((childrenById.get(storageId) ?? []).some(child => namesById.get(child) === valueClass)) return true;
+        }
+      }
+      return false;
+    };
+
+    expect(retains("Map", "SnapshotMapKeyForHeap")).toBe(true);
+    expect(retains("Map", "SnapshotMapValueForHeap")).toBe(true);
+    expect(retains("Set", "SnapshotSetValueForHeap")).toBe(true);
+    expect(collections.map.size).toBe(1);
+    expect(collections.set.size).toBe(1);
+  } finally {
+    delete (globalThis as any).__snapshotMapSetCollections;
+  }
+});

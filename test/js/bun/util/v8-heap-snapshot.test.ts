@@ -111,3 +111,12 @@ test("v8 heap snapshot labels Web Streams internal edges", async () => {
     expect.arrayContaining(["source", "destination", "reader", "writer", "promise"]),
   );
 });
+
+test("v8 heap snapshot retains Map and Set entries", async () => {
+  const counts = await runFixture("collection-edges");
+  expect(counts.array[0]).toBeGreaterThan(0);
+  expect(counts.map[0]).toBeGreaterThan(0);
+  expect(counts.set[0]).toBeGreaterThan(0);
+  expect(counts.map[1]).toBe(0);
+  expect(counts.set[1]).toBe(0);
+});

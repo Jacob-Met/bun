@@ -164,6 +164,50 @@ switch (mode) {
     break;
   }
 
+  case "collection-edges": {
+    // Distinct values have only one intended owner: the collection in `kept`.
+    // The snapshot's reachability graph must preserve Map/Set retention just
+    // as it preserves Array retention.
+    const count = 128;
+    const kept = {
+      array: Array.from({ length: count }, (_, i) => `array-${i}-`.padEnd(256, "a")),
+      map: new Map(Array.from({ length: count }, (_, i) => [i, `map-${i}-`.padEnd(256, "m")])),
+      set: new Set(Array.from({ length: count }, (_, i) => `set-${i}-`.padEnd(256, "s"))),
+    };
+    Reflect.set(globalThis, "kept", kept);
+    const snapshot = JSON.parse(Bun.generateHeapSnapshot("v8"));
+    const { node_fields, edge_fields, node_types } = snapshot.snapshot.meta;
+    const nf = node_fields.length,
+      ef = edge_fields.length;
+    const nameAt = node_fields.indexOf("name"),
+      countAt = node_fields.indexOf("edge_count");
+    const typeAt = node_fields.indexOf("type"),
+      toAt = edge_fields.indexOf("to_node");
+    const first = [0];
+    const reached = new Uint8Array(snapshot.nodes.length / nf);
+    for (let n = 0; n < reached.length; n++) first.push(first[n] + snapshot.nodes[n * nf + countAt]);
+    const stack = [0];
+    reached[0] = 1;
+    while (stack.length) {
+      const n = stack.pop()!;
+      for (let e = first[n]; e < first[n + 1]; e++) {
+        const target = snapshot.edges[e * ef + toAt] / nf;
+        if (!reached[target]) {
+          reached[target] = 1;
+          stack.push(target);
+        }
+      }
+    }
+    const totals: Record<string, [number, number]> = { array: [0, 0], map: [0, 0], set: [0, 0] };
+    for (let n = 0; n < reached.length; n++) {
+      if (node_types[0][snapshot.nodes[n * nf + typeAt]] !== "string") continue;
+      const kind = /^(array|map|set)-\d+-/.exec(snapshot.strings[snapshot.nodes[n * nf + nameAt]])?.[1];
+      if (kind) totals[kind][reached[n] ? 0 : 1]++;
+    }
+    result = totals;
+    break;
+  }
+
   default:
     throw new Error(`Unknown mode: ${mode}`);
 }
